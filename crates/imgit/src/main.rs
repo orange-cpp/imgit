@@ -37,6 +37,10 @@ use crate::fonts::{FontRequest, TextSettings};
 /// `--gallery`: the widget gallery instead of the application.
 const GALLERY_FLAG: &str = "--gallery";
 
+// Dear ImGui only allows one thread to own a context at a time.
+#[cfg(test)]
+static IMGUI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn main() -> anyhow::Result<ExitCode> {
     let startup_start = std::time::Instant::now();
     // `git` runs ImGit as its GIT_ASKPASS with the prompt as the only argument: answer it and exit before any

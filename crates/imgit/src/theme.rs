@@ -1401,6 +1401,9 @@ mod tests {
 
     #[test]
     fn style_follows_the_palette() {
+        let _guard = crate::IMGUI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _context = dear_imgui_rs::Context::create();
         let p = Palette::default();
         apply_imgui_style(&p, 2.0);

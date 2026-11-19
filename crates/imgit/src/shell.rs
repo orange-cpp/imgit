@@ -895,6 +895,9 @@ mod input_tests {
 
     #[test]
     fn quick_command_v_pastes_once_and_drains_queued_release() {
+        let _guard = crate::IMGUI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut context = Context::create();
         context.set_ini_filename(None::<String>).unwrap();
         context.set_clipboard_backend(Clipboard);
