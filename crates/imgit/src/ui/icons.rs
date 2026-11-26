@@ -441,6 +441,11 @@ fn draw_raster(draw: DrawList<'_>, cached: CachedTexture, pos: Vec2, color: Colo
     );
 }
 
+/// The spinner turns half a circle a second.
+fn spinner_degrees(time: f64) -> f32 {
+    ((time % 2.0) * 180.0) as f32
+}
+
 impl Cx<'_> {
     /// Whether `name` ("far:undo-alt", "fas:flask", ...) is a known icon.
     #[must_use]
@@ -689,7 +694,20 @@ impl Cx<'_> {
         size: f32,
         color: Color,
     ) {
+        if icon == Icon::Spinner {
+            self.keep_animating();
+        }
         match icon.fa_name().filter(|name| self.has_fa_icon(name)) {
+            Some(name) if icon == Icon::Spinner => {
+                self.draw_fa_icon_rotated(
+                    draw,
+                    name,
+                    center,
+                    size,
+                    color,
+                    spinner_degrees(self.time()),
+                );
+            }
             Some(name) => self.draw_fa_icon(draw, name, center, size, color),
             None => self.draw_icon_vector(draw, icon, center, size, color),
         }
@@ -747,6 +765,13 @@ impl Cx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_spinner_turns_half_a_circle_a_second() {
+        assert_eq!(spinner_degrees(0.0), 0.0);
+        assert_eq!(spinner_degrees(1.0), 180.0);
+        assert_eq!(spinner_degrees(2.5), 90.0);
+    }
 
     #[test]
     fn parses_the_icon_table() {

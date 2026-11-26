@@ -281,8 +281,7 @@ impl Cx<'_> {
                 line(at(0.1, 0.05), at(0.4, 0.05));
             }
             Icon::Spinner => {
-                // The C++ `fmod(time * 5, 6.28318)`.
-                let a = (self.time() * 5.0 % 6.28318) as f32;
+                let a = super::spinner_degrees(self.time()).to_radians();
                 draw.path_arc_to(c, s * 0.75, a, a + 4.2, 16);
                 draw.path_stroke(color, false, t);
             }

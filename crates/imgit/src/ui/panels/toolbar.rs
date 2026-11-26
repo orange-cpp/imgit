@@ -256,15 +256,13 @@ fn lfs_button(cx: &mut Cx<'_>, busy: bool, open: bool) -> bool {
     };
     let baseline = pos.y + cx.px(29.0);
     if busy {
-        cx.draw_fa_icon_rotated(
+        cx.draw_icon(
             draw,
-            "far:circle-notch",
+            Icon::Spinner,
             vec2(pos.x + cx.px(23.5), baseline - cx.px(5.5)),
             cx.px(16.0),
             color,
-            spinner_degrees(cx.time()),
         );
-        cx.keep_animating();
     } else {
         let regular = cx.fonts.regular;
         let ascent = cx.font_px(regular, 16.0) * ASCENT_RATIO;
@@ -287,11 +285,6 @@ fn lfs_button(cx: &mut Cx<'_>, busy: bool, open: bool) -> bool {
     );
     ui.same_line_with_spacing(0.0, cx.px(LFS_MARGIN));
     clicked && !busy
-}
-
-/// The spinner turns half a circle a second.
-fn spinner_degrees(time: f64) -> f32 {
-    ((time % 2.0) * 180.0) as f32
 }
 
 fn toolbar_separator(cx: &Cx<'_>, draw: DrawList<'_>, height: f32) {
@@ -1176,12 +1169,5 @@ mod tests {
             "Cherry pick in progress"
         );
         assert_eq!(state_label(OperationState::None), "");
-    }
-
-    #[test]
-    fn the_spinner_turns_half_a_circle_a_second() {
-        assert_eq!(spinner_degrees(0.0), 0.0);
-        assert_eq!(spinner_degrees(1.0), 180.0);
-        assert_eq!(spinner_degrees(2.5), 90.0);
     }
 }
