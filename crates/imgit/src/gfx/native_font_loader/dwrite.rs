@@ -391,3 +391,53 @@ unsafe extern "C" fn baked_load_glyph(
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dear_imgui_rs::{Context, FontSource, TextureFormat};
+
+    #[test]
+    fn directwrite_rasterizes_subpixel_glyphs_in_a_headless_atlas() {
+        let _guard = crate::IMGUI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut context = Context::create();
+        context.set_ini_filename(None::<String>).unwrap();
+        context.io_mut().set_display_size([640.0, 240.0]);
+        context.io_mut().set_delta_time(1.0 / 60.0);
+        let regular = crate::assets::data("fonts/OpenSans-Regular.ttf").unwrap();
+        let loader = font_loader(crate::fonts::TextSettings::default().curve)
+            .expect("this Windows installation supports the DirectWrite loader");
+        let atlas = context.font_atlas();
+        atlas.set_font_loader(loader).unwrap();
+        // SAFETY: an embedded, complete TrueType font. The atlas owns its copy.
+        let source = unsafe { FontSource::ttf_data_with_size(regular, 22.0) };
+        let font = atlas.add_font(&[source]);
+        atlas.try_claim_legacy_renderer().unwrap().build();
+
+        let ui = context.frame();
+        ui.window("DirectWrite glyphs").build(|| {
+            let _font = ui.push_font_with_size(Some(font), 22.0);
+            let [without_space, _] = ui.calc_text_size("WA");
+            let [with_space, line_height] = ui.calc_text_size("W A");
+            assert!(without_space > 0.0);
+            assert!(with_space > without_space, "space must advance the cursor");
+            assert!(line_height >= 22.0);
+            ui.text("W A é Ω");
+        });
+        let texture = ui.font_atlas_texture().unwrap();
+        assert_eq!(texture.format(), TextureFormat::RGBA32);
+        let pixels = texture.pixels().unwrap();
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|[red, green, blue, alpha]| *alpha == 255 && (red != green || green != blue)),
+            "the font atlas should contain non-gray ClearType coverage",
+        );
+        drop(texture);
+        drop(context.render_legacy());
+    }
+}

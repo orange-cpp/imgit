@@ -132,3 +132,123 @@ impl Frame for AppFrame {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imgit_git::Repository;
+
+    use crate::dev::DevOptions;
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn startup_and_dev_commands_open_the_requested_repository_revision_and_path() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Startup test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("startup@example.invalid"))
+            .unwrap();
+        let path = "tracked.txt";
+        std::fs::write(repo.workdir().join(path), "Before\n").unwrap();
+        repo.stage(&[path]).unwrap();
+        let sha = repo.commit("Add tracked file", false).unwrap();
+        std::fs::write(repo.workdir().join(path), "After\n").unwrap();
+
+        let app = Application::with_config_directory(scratch.path().join("config"));
+        let options = DevOptions {
+            repo: Some(repo.workdir().to_owned()),
+            ..DevOptions::default()
+        };
+        let mut frames = TestFrames::with_options(options);
+        let mut application_frame = None;
+        frames.draw(|cx| {
+            let mut created = AppFrame::new(app, &mut cx.shell);
+            created.ui_state.avatars.set_enabled(false);
+            created.draw(cx.ui, &mut cx.shell);
+            application_frame = Some(created);
+        });
+        let mut app_frame = application_frame.unwrap();
+        assert_eq!(app_frame.app.active_workdir(), Some(repo.workdir()));
+        assert!(app_frame.app.started_with_repository);
+        let state = app_frame.app.active().unwrap();
+        let row = state.history.row_by_sha[&sha];
+        let workdir = state.history.row_by_sha[imgit_app::WIP_SHA];
+
+        frames.draw(|cx| {
+            app_frame.dev_command(DevCommand::SelectRow(row), &mut cx.shell);
+            app_frame.dev_command(
+                DevCommand::OpenFile {
+                    path: path.to_owned(),
+                    file_history: false,
+                    blame: false,
+                },
+                &mut cx.shell,
+            );
+        });
+        let committed = app_frame.app.active().unwrap();
+        assert_eq!(committed.selected, [sha.as_str()]);
+        assert_eq!(
+            committed.diff_target.as_ref().unwrap().source,
+            DiffSource::Commit(sha.clone())
+        );
+
+        frames.draw(|cx| {
+            app_frame.dev_command(DevCommand::SelectRow(workdir), &mut cx.shell);
+            app_frame.dev_command(
+                DevCommand::OpenFile {
+                    path: path.to_owned(),
+                    file_history: false,
+                    blame: false,
+                },
+                &mut cx.shell,
+            );
+        });
+        let working_copy = app_frame.app.active().unwrap();
+        assert_eq!(
+            working_copy.diff_target.as_ref().unwrap().source,
+            DiffSource::Unstaged
+        );
+
+        frames.draw(|cx| {
+            app_frame.dev_command(DevCommand::SelectRow(row), &mut cx.shell);
+            app_frame.dev_command(
+                DevCommand::OpenFile {
+                    path: path.to_owned(),
+                    file_history: true,
+                    blame: true,
+                },
+                &mut cx.shell,
+            );
+        });
+        let history = app_frame
+            .app
+            .active()
+            .unwrap()
+            .file_history
+            .as_ref()
+            .unwrap();
+        assert_eq!(history.path, path);
+        assert_eq!(history.from.as_deref(), Some(sha.as_str()));
+        assert!(history.blame);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app_frame.busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "file history did not settle"
+            );
+            frames.draw(|cx| app_frame.draw(cx.ui, &mut cx.shell));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let history = app_frame
+            .app
+            .active()
+            .unwrap()
+            .file_history
+            .as_ref()
+            .unwrap();
+        assert_eq!(history.history.entries[0].commit.sha, sha);
+        assert_eq!(history.blame_data.as_ref().unwrap().hunks[0].sha, sha);
+    }
+}

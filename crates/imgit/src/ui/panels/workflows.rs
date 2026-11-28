@@ -498,6 +498,220 @@ pub fn draw_branch_cleanup(cx: &mut Cx<'_>, app: &mut Application, state: &mut R
 mod tests {
     use super::*;
 
+    use crate::shell::test_frame::{TestFrames, window_rect};
+
+    fn gitflow_repo() -> (tempfile::TempDir, Repository, Application, String, String) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Workflow test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("workflow@example.invalid"))
+            .unwrap();
+        repo.set_local_config("commit.gpgSign", Some("false"))
+            .unwrap();
+        repo.set_local_config("tag.gpgSign", Some("false")).unwrap();
+        std::fs::write(repo.workdir().join("file.txt"), "Base\n").unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let base = repo.commit("Base", false).unwrap();
+        let main = repo
+            .load_history(&Default::default())
+            .unwrap()
+            .head_branch
+            .unwrap();
+        let develop = "integration";
+        assert_ne!(main, develop);
+        repo.create_branch(develop, &base, false).unwrap();
+        repo.set_local_config("gitflow.branch.master", Some(&main))
+            .unwrap();
+        repo.set_local_config("gitflow.branch.develop", Some(develop))
+            .unwrap();
+        repo.set_local_config("gitflow.prefix.versiontag", Some("v"))
+            .unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, repo, app, main, base)
+    }
+
+    fn select(
+        frames: &mut TestFrames,
+        app: &mut Application,
+        label: &str,
+        menu: impl FnOnce(&mut Cx<'_>, &mut Application, &mut RepoState) -> MenuItems,
+    ) {
+        frames.draw(|cx| {
+            let clicked = app
+                .with_active(|app, state| {
+                    let item = menu(cx, app, state)
+                        .into_iter()
+                        .find(|item| item.label == label)
+                        .unwrap();
+                    assert!(item.enabled);
+                    item.click.unwrap()
+                })
+                .unwrap();
+            clicked(cx, app);
+        });
+    }
+
+    fn input_name(frames: &mut TestFrames, app: &mut Application, name: &str) {
+        for _ in 0..3 {
+            frames.draw(|cx| super::super::dialogs::draw_dialogs(cx, app));
+        }
+        frames.type_text(name);
+        frames.draw(|cx| super::super::dialogs::draw_dialogs(cx, app));
+        assert_eq!(app.dialog.text_a, name);
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| super::super::dialogs::draw_dialogs(cx, app));
+        frames.set_key(Key::Enter, false);
+        frames.draw(|cx| super::super::dialogs::draw_dialogs(cx, app));
+        assert!(!app.dialog.is_open());
+    }
+
+    fn wait_for_git(app: &mut Application, title: &str) {
+        assert_eq!(
+            app.active().unwrap().async_op.as_ref().unwrap().title,
+            title
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.active().unwrap().busy() {
+            assert!(Instant::now() < deadline, "{title} did not finish");
+            app.poll_async();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_ne!(
+            app.toasts.history()[0].kind,
+            ToastKind::Error,
+            "{title} failed"
+        );
+    }
+
+    #[test]
+    fn gitflow_release_starts_from_integration_and_finishes_on_both_branches() {
+        let (_scratch, repo, mut app, main, base) = gitflow_repo();
+        let mut frames = TestFrames::new();
+        select(&mut frames, &mut app, "Start Release", gitflow_start_items);
+        assert!(app.dialog.is(DialogKind::TextPrompt));
+        input_name(&mut frames, &mut app, "1.2.0");
+        wait_for_git(&mut app, "Start release 1.2.0");
+        let state = app.active().unwrap();
+        assert_eq!(state.history.head_branch.as_deref(), Some("release/1.2.0"));
+        assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+
+        std::fs::write(repo.workdir().join("release.txt"), "Release notes\n").unwrap();
+        repo.stage(&["release.txt"]).unwrap();
+        let release = repo.commit("Release change", false).unwrap();
+        app.active_mut().unwrap().refresh();
+        select(
+            &mut frames,
+            &mut app,
+            "Finish release 1.2.0",
+            |cx, app, state| gitflow_finish_items(cx, app, state, "release/1.2.0"),
+        );
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert!(app.dialog.message.contains("tag it 'v1.2.0'"));
+        let confirm = app.dialog.on_confirm.take().unwrap();
+        app.dialog.close();
+        frames.draw(|cx| confirm(cx, &mut app));
+        wait_for_git(&mut app, "Finish release 1.2.0");
+
+        let state = app.active().unwrap();
+        assert!(state.find_ref("refs/heads/release/1.2.0").is_none());
+        let main_tip = &state
+            .find_ref(&format!("refs/heads/{main}"))
+            .unwrap()
+            .target;
+        let tag = state.find_ref("refs/tags/v1.2.0").unwrap();
+        assert_eq!(&tag.target, main_tip);
+        assert!(repo.is_ancestor(&release, main_tip));
+        assert_eq!(state.history.head_branch.as_deref(), Some("integration"));
+        assert!(repo.is_ancestor(&release, state.history.head_sha.as_deref().unwrap()));
+        assert!(repo.workdir().join("release.txt").is_file());
+    }
+
+    #[test]
+    fn gitflow_refuses_to_start_a_feature_with_modified_tracked_files() {
+        let (_scratch, repo, mut app, main, base) = gitflow_repo();
+        std::fs::write(repo.workdir().join("file.txt"), "Local work\n").unwrap();
+        app.active_mut().unwrap().refresh();
+        let mut frames = TestFrames::new();
+        select(&mut frames, &mut app, "Start Feature", gitflow_start_items);
+        input_name(&mut frames, &mut app, "protected");
+        let state = app.active().unwrap();
+        assert!(!state.busy());
+        assert!(state.find_ref("refs/heads/feature/protected").is_none());
+        assert_eq!(state.history.head_branch.as_deref(), Some(main.as_str()));
+        assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+        assert_eq!(app.toasts.history()[0].title, "Start feature failed");
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join("file.txt")).unwrap(),
+            "Local work\n"
+        );
+    }
+
+    #[test]
+    fn branch_cleanup_deletes_only_checked_candidates_and_supports_undo_and_redo() {
+        let (_scratch, repo, mut app, main, base) = gitflow_repo();
+        for branch in ["delete-merged", "keep-merged"] {
+            repo.create_branch(branch, &base, false).unwrap();
+        }
+        repo.create_branch("unmerged", &base, true).unwrap();
+        let unmerged = repo.commit("Unmerged", false).unwrap();
+        repo.checkout_branch(&main).unwrap();
+        app.active_mut().unwrap().refresh();
+
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            app.with_active(|app, state| open_branch_cleanup(cx, app, state))
+                .unwrap()
+        });
+        assert!(app.dialog.is(DialogKind::BranchCleanup));
+        let labels: Vec<_> = app
+            .dialog
+            .checks
+            .iter()
+            .map(|check| check.label.as_str())
+            .collect();
+        assert_eq!(labels, ["delete-merged", "keep-merged"]);
+        app.dialog
+            .checks
+            .iter_mut()
+            .find(|check| check.label == "keep-merged")
+            .unwrap()
+            .checked = false;
+
+        let mut delete_at = crate::ui::Vec2::ZERO;
+        for _ in 0..3 {
+            frames.draw(|cx| {
+                super::super::dialogs::draw_dialogs(cx, &mut app);
+                delete_at = window_rect(cx, c"Clean Up Branches").max - vec2(65.0, 30.0);
+            });
+        }
+        frames.click_left(delete_at, |cx| {
+            super::super::dialogs::draw_dialogs(cx, &mut app)
+        });
+        assert!(!app.dialog.is_open());
+        assert_eq!(app.toasts.history()[0].title, "Deleted 1 branch");
+        app.with_active(|app, state| {
+            assert!(state.find_ref("refs/heads/delete-merged").is_none());
+            assert!(state.find_ref("refs/heads/keep-merged").is_some());
+            assert!(state.find_ref("refs/heads/integration").is_some());
+            assert_eq!(
+                state.find_ref("refs/heads/unmerged").unwrap().target,
+                unmerged
+            );
+
+            app.undo(state);
+            assert_eq!(
+                state.find_ref("refs/heads/delete-merged").unwrap().target,
+                base
+            );
+            app.redo(state);
+            assert!(state.find_ref("refs/heads/delete-merged").is_none());
+            assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+        })
+        .unwrap();
+    }
+
     #[test]
     fn labels_count_the_branches() {
         assert_eq!(delete_label(0), "Delete 0 Branches");

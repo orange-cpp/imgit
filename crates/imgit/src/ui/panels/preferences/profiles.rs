@@ -107,6 +107,7 @@ fn profile_row_menu(page: &mut Page<'_, '_>) {
         for (i, (label, disabled, style)) in items.into_iter().enumerate() {
             let top = ITEM * i as f32;
             let clicked = menu.hit(label, 1.0, top, 158.0, ITEM, !disabled);
+
             if menu.cx.ui.is_item_hovered() && !disabled {
                 menu.boxed(1.0, top, 158.0, ITEM, BoxStyle::fill(hover_row));
             }
@@ -140,18 +141,15 @@ fn profile_row_menu(page: &mut Page<'_, '_>) {
     }
 }
 
+const PROFILES_INTRO: &str = "ImGit Desktop uses profiles to store your application preferences as well as git config information. \
+    The preferences you set after installing are set as your default profile. Create additional profiles \
+    to quickly switch between them for different work environments.";
+
 pub(super) fn profiles_page(page: &mut Page<'_, '_>) {
     let mut form = Form::new(page);
     let form = &mut form;
     title(page, form, "Profiles");
-    paragraph(
-        page,
-        form,
-        "ImGit Desktop uses profiles to store your application preferences as well as git config information. \
-         The preferences you set after installing are set as your default profile. Create additional profiles \
-         to quickly switch between them for different work environments.",
-        10.0,
-    );
+    paragraph(page, form, PROFILES_INTRO, 10.0);
     // div.panel-bg1.py1.px3.my3: as wide as its text.
     let heading_style = Style::ink(18.0, 0.75);
     let keep = "Keep my .gitconfig updated with my ImGit Desktop Profile preferences";
@@ -669,6 +667,138 @@ pub(super) fn draw_profile_dialogs(cx: &mut Cx<'_>, app: &mut Application) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+    use imgit_app::profiles::Profiles;
+
+    #[test]
+    fn profile_dialogs_validate_copy_edit_and_delete_the_profile_on_disk() {
+        let scratch = tempfile::tempdir().unwrap();
+        let config = scratch.path().join("config");
+        let mut app = Application::with_config_directory(config.clone());
+        app.set_keep_git_config(false);
+        app.preferences_page = "Profiles".to_owned();
+        app.settings.auto_fetch_minutes = 17;
+        let original = app.profiles.current().guid.clone();
+        let mut frames = TestFrames::new();
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            super::super::draw_preferences(cx, app, vec2(1260.0, 730.0));
+        };
+
+        open_add_profile(&mut app);
+        app.profile_dialog.values.user_name = "Test Author".to_owned();
+        app.profile_dialog.values.user_email = "invalid-email".to_owned();
+        for _ in 0..3 {
+            frames.draw(|cx| draw(cx, &mut app));
+        }
+        frames.type_text("Work profile");
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(app.profiles.all().len(), 1);
+        assert_eq!(app.profile_dialog.kind, Some(ProfileDialogKind::AddEdit));
+        assert_eq!(app.profile_dialog.values.name, "Work profile");
+
+        frames.set_key(Key::Enter, false);
+        app.profile_dialog.copy_current = true;
+        app.profile_dialog.values.user_email = "author@example.invalid".to_owned();
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(app.profile_dialog.kind, None);
+        let guid = app.pending_profile.take().unwrap();
+        let created = app.profiles.find(&guid).unwrap().clone();
+        assert_eq!(created.name, "Work profile");
+        assert_eq!(created.user_email, "author@example.invalid");
+        assert_eq!(app.profiles.current().guid, original);
+        let mut saved = crate::app::settings::Settings::default();
+        saved.load(&app.profiles.directory_of(&guid).join("settings.txt"));
+        assert_eq!(saved.auto_fetch_minutes, 17);
+
+        frames.set_key(Key::Enter, false);
+        frames.draw(|cx| draw(cx, &mut app));
+        open_edit_profile(&mut app, &created);
+        app.profile_dialog.values.user_name = "Updated Author".to_owned();
+        for _ in 0..2 {
+            frames.draw(|cx| draw(cx, &mut app));
+        }
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(app.profile_dialog.kind, None);
+        let reloaded = Profiles::load(&config, "", "", &[]);
+        let stored = reloaded.find(&guid).unwrap();
+        assert_eq!(stored.user_name, "Updated Author");
+        assert_eq!(stored.user_email, "author@example.invalid");
+
+        frames.set_key(Key::Enter, false);
+        open_delete_profile(&mut app, stored);
+        let mut confirm = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let (pos, size) = raw::work_area(cx.ui);
+                confirm = pos + vec2((size.x - 600.0) / 2.0 + 540.0, 82.0 + 166.0);
+                draw(cx, &mut app);
+            });
+        }
+        frames.click_left(confirm, |cx| draw(cx, &mut app));
+        assert_eq!(app.profile_dialog.kind, None);
+        assert!(app.profiles.find(&guid).is_none());
+        assert!(!app.profiles.directory_of(&guid).exists());
+        assert_eq!(app.profiles.current().guid, original);
+    }
+
+    #[test]
+    fn the_profile_table_menu_switches_to_the_row_it_was_opened_for() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.set_keep_git_config(false);
+        let original = app.profiles.current().guid.clone();
+        let wanted = app
+            .profiles
+            .create(
+                Profile {
+                    name: "Z Work".to_owned(),
+                    user_name: "Test Author".to_owned(),
+                    user_email: "profile@example.invalid".to_owned(),
+                    ..Profile::default()
+                },
+                false,
+            )
+            .unwrap();
+        app.preferences_page = "Profiles".to_owned();
+        let mut frames = TestFrames::new();
+        let size = vec2(1260.0, 730.0);
+        let mut ellipsis = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let origin = cx.cursor() + vec2(300.0, 0.0);
+                let draw = cx.window_draw_list();
+                let page = Page::new(cx, &mut app, draw, origin, size.x - 300.0);
+                let wrap = page.wrap(LABEL, PROFILES_INTRO, Form::new(&page).width);
+                let intro_h = wrap.len() as f32 * 20.0;
+                // Paragraph, profile options, Add button, table header and the current row.
+                let second_row_top = 56.39 + intro_h + 20.0 + 96.94 + 20.0 + 91.0 + 64.0;
+                ellipsis = origin + vec2(size.x - 300.0 - 95.0 + 20.0, second_row_top + 25.0);
+                super::super::draw_preferences(cx, &mut app, size);
+            });
+        }
+
+        frames.click_left(ellipsis, |cx| {
+            super::super::draw_preferences(cx, &mut app, size)
+        });
+        assert_eq!(app.panels.preferences.menu_guid, wanted);
+        let (_, bottom_right) = app.panels.preferences.menu_button;
+        let switch = bottom_right + vec2(-80.0, 18.0);
+        frames.move_mouse(switch.into());
+        // Allow the overlapping popup item to acquire hover before pressing.
+        for _ in 0..2 {
+            frames.draw(|cx| super::super::draw_preferences(cx, &mut app, size));
+        }
+        frames.click_left(switch, |cx| {
+            super::super::draw_preferences(cx, &mut app, size)
+        });
+        assert_eq!(app.pending_profile.as_deref(), Some(wanted.as_str()));
+        assert_eq!(app.profiles.current().guid, original);
+    }
 
     #[test]
     fn emails() {

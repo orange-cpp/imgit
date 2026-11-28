@@ -1611,6 +1611,13 @@ fn overlong_and_c1_utf8_becomes_a_replacement_character() {
 }
 
 #[test]
+fn an_escape_with_multiple_intermediates_consumes_its_final_byte() {
+    let screen = fed(10, 1, "a\x1b(/Zb");
+    assert_eq!(rows(&screen), ["ab"]);
+    assert_eq!(at(&screen), (2, 0));
+}
+
+#[test]
 fn csi_parameters_and_intermediates_are_capped() {
     // A sequence that never ends is bounded; once it does end the screen carries on.
     let mut input = String::from("\x1b[");

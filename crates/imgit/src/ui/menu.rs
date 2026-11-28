@@ -1098,6 +1098,43 @@ pub fn draw_menus(cx: &mut Cx<'_>, app: &mut Application) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn a_keyboard_submenu_skips_disabled_items_and_runs_the_selected_action_once() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let calls = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&calls);
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let menu = vec![
+                MenuItem::disabled("Unavailable"),
+                MenuItem::separator(),
+                menu_submenu(
+                    "Operations",
+                    vec![
+                        MenuItem::disabled("Unavailable child"),
+                        menu_item("Run", move |_, _| counter.set(counter.get() + 1)),
+                    ],
+                ),
+            ];
+            popup_menu(cx, menu, Some(vec2(100.0, 100.0)));
+            draw_menus(cx, &mut app);
+        });
+
+        for key in [Key::DownArrow, Key::RightArrow, Key::Enter] {
+            frames.set_key(key, true);
+            frames.draw(|cx| draw_menus(cx, &mut app));
+            frames.set_key(key, false);
+            frames.draw(|cx| draw_menus(cx, &mut app));
+        }
+        assert_eq!(calls.get(), 1);
+        frames.draw(|cx| assert!(!menu_open(cx)));
+    }
 
     fn plain(label: &str) -> MenuItem {
         MenuItem {

@@ -402,7 +402,10 @@ pub(super) fn sparse_checkout_page(page: &mut Page<'_, '_>) {
         "Enter one path per line. Only these paths will be checked out in your working directory. If no paths \
          are provided, only root files will be checked out.",
     );
-    let enabled = git_flag(page.app, Scope::Repo, "core.sparseCheckout", false);
+    let enabled = page
+        .app
+        .active()
+        .is_some_and(|state| state.repo.sparse_checkout_enabled());
     let no_repo = page.app.active().is_none();
     let mut x = 40.0;
     let label = if enabled {
@@ -462,6 +465,188 @@ pub(super) fn sparse_checkout_page(page: &mut Page<'_, '_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::application::Application;
+    use crate::shell::test_frame::TestFrames;
+    use crate::ui::{Vec2, vec2};
+    use imgit_git::Repository;
+
+    fn worktree() -> (tempfile::TempDir, Repository, Application, String) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Preferences test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("preferences@example.invalid"))
+            .unwrap();
+        for path in ["src/main.txt", "docs/note.txt"] {
+            let file = repo.workdir().join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, path).unwrap();
+            repo.stage(&[path]).unwrap();
+        }
+        let head = repo.commit("Initial files", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, repo, app, head)
+    }
+
+    fn finish_command(app: &mut Application, expected_title: &str) {
+        let operation = app
+            .active()
+            .unwrap()
+            .async_op
+            .as_ref()
+            .unwrap_or_else(|| panic!("{expected_title} did not start"));
+        assert_eq!(operation.title, expected_title);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{expected_title} timed out"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_ne!(
+            app.toasts.history()[0].kind,
+            ToastKind::Error,
+            "{expected_title} failed"
+        );
+    }
+
+    #[test]
+    fn gitflow_validates_the_branches_then_creates_and_configures_the_develop_branch() {
+        let (_scratch, repo, mut app, head) = worktree();
+        let main = app
+            .active()
+            .unwrap()
+            .history
+            .head_branch
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            app.active()
+                .unwrap()
+                .find_ref("refs/heads/integration")
+                .is_none()
+        );
+        app.preferences_page = "Gitflow".to_owned();
+        let mut frames = TestFrames::new();
+        let size = vec2(1260.0, 730.0);
+        let mut button = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let control = 55.0 + (size.x - 300.0 - 110.0) / 4.0 + 15.0;
+                button = cx.cursor() + vec2(300.0 + control + 58.0, 426.0);
+                super::super::draw_preferences(cx, &mut app, size);
+            });
+        }
+        app.panels.preferences.gitflow.values[0].clone_from(&main);
+        app.panels.preferences.gitflow.values[1] = "-invalid".to_owned();
+        frames.click_left(button, |cx| {
+            super::super::draw_preferences(cx, &mut app, size)
+        });
+        assert_eq!(
+            app.toasts.history()[0].title,
+            "Could not initialize Gitflow"
+        );
+        assert!(!app.active().unwrap().busy());
+        assert!(repo.config_string("gitflow.branch.develop").is_none());
+
+        app.panels.preferences.gitflow.values[1] = "integration".to_owned();
+        frames.click_left(button, |cx| {
+            super::super::draw_preferences(cx, &mut app, size)
+        });
+        finish_command(&mut app, "Initialize Gitflow");
+        let state = app.active().unwrap();
+        let develop = state.find_ref("refs/heads/integration").unwrap();
+        assert_eq!(develop.target, head);
+        assert_eq!(
+            repo.config_string("gitflow.branch.master").as_deref(),
+            Some(main.as_str())
+        );
+        assert_eq!(
+            repo.config_string("gitflow.branch.develop").as_deref(),
+            Some("integration")
+        );
+        assert_eq!(
+            repo.config_string("gitflow.prefix.support").as_deref(),
+            Some("support/")
+        );
+    }
+
+    #[test]
+    fn sparse_checkout_applies_the_entered_path_and_disabling_restores_the_other_files() {
+        let (_scratch, repo, mut app, head) = worktree();
+        app.preferences_page = "Sparse Checkout".to_owned();
+        let size = vec2(1260.0, 730.0);
+        let mut origin = Vec2::ZERO;
+        let mut frames = TestFrames::new();
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor() + vec2(300.0, 0.0);
+                super::super::draw_preferences(cx, &mut app, size);
+            });
+        }
+        frames.click_left(origin + vec2(80.0, 124.0), |cx| {
+            super::super::draw_preferences(cx, &mut app, size)
+        });
+        frames.type_text("src");
+        frames.draw(|cx| super::super::draw_preferences(cx, &mut app, size));
+        assert_eq!(app.panels.preferences.sparse.paths, "src");
+        frames.click_left(origin + vec2(68.0, 390.0), |cx| {
+            super::super::draw_preferences(cx, &mut app, size)
+        });
+        finish_command(&mut app, "Enable sparse checkout");
+        assert!(repo.workdir().join("src/main.txt").is_file());
+        assert!(!repo.workdir().join("docs/note.txt").exists());
+        assert!(repo.sparse_checkout_enabled());
+
+        let mut disable = Vec2::ZERO;
+        frames.draw(|cx| {
+            let update_w = 18.0
+                + cx.text_size(cx.fonts.regular, 12.0, "Update sparse checkout")
+                    .x;
+            disable = origin + vec2(40.0 + update_w + 8.0 + 20.0, 390.0);
+            super::super::draw_preferences(cx, &mut app, size);
+        });
+        frames.click_left(disable, |cx| {
+            super::super::draw_preferences(cx, &mut app, size)
+        });
+        finish_command(&mut app, "Disable sparse checkout");
+        assert!(repo.workdir().join("docs/note.txt").is_file());
+        assert!(!repo.sparse_checkout_enabled());
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(head.as_str())
+        );
+    }
+
+    #[test]
+    fn saving_a_template_updates_local_config_and_invalidates_the_commit_form() {
+        let (_scratch, repo, mut app, _) = worktree();
+        app.preferences_page = "Commit".to_owned();
+        app.active_mut().unwrap().commit_form_ready = true;
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| super::super::draw_preferences(cx, &mut app, vec2(1260.0, 730.0)));
+        let draft = &mut app.panels.preferences.template;
+        draft.summary = "Intent".to_owned();
+        draft.description = "Reason".to_owned();
+        frames.draw(|cx| {
+            let origin = cx.cursor();
+            let draw = cx.window_draw_list();
+            let mut page = Page::new(cx, &mut app, draw, origin, 960.0);
+            save_template(&mut page);
+        });
+        assert!(!app.active().unwrap().commit_form_ready);
+        assert_eq!(repo.commit_template().as_deref(), Some("Intent\n\nReason"));
+        let file = Path::new(&repo.common_dir()).join("imgit_template");
+        assert_eq!(fs::read_to_string(file).unwrap(), "Intent\n\nReason\n");
+        let draft = &app.panels.preferences.template;
+        assert_eq!(draft.saved_summary, "Intent");
+        assert_eq!(draft.saved_description, "Reason");
+        assert_eq!(app.toasts.history()[0].title, "Commit template saved");
+    }
 
     #[test]
     fn template_files() {

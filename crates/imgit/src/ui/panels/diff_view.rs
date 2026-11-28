@@ -2105,6 +2105,481 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_editor_number_gutter_selects_the_changed_line() {
+        use crate::shell::test_frame::TestFrames;
+
+        let mut frames = TestFrames::new();
+        let mut diff = sample();
+        diff.hunks[0].lines[2].text = "let new_value = 1;".to_owned();
+        let mut selected = Vec::new();
+        let mut click_at = Vec2::default();
+
+        let draw = |cx: &mut Cx<'_>, selected: &mut Vec<_>| {
+            let min = cx.cursor();
+            let max = min + vec2(480.0, 240.0);
+            let mut options = DiffEditorOptions {
+                selected_lines: Some(selected),
+                show_whitespace: true,
+                ..DiffEditorOptions::default()
+            };
+            draw_diff_editor(cx, Some(&diff), "", min, max, &mut options);
+            // The new-line side of the gutter, halfway down the added row.
+            min + vec2(NEW_NUMBERS_RIGHT - 4.0, cx.px(code_style(cx).line_h) * 2.5)
+        };
+
+        for _ in 0..2 {
+            frames.draw(|cx| click_at = draw(cx, &mut selected));
+        }
+        frames.move_mouse(click_at.into());
+        frames.draw(|cx| {
+            draw(cx, &mut selected);
+        });
+        assert!(selected.is_empty());
+        frames.set_left_mouse(true);
+        frames.draw(|cx| {
+            draw(cx, &mut selected);
+        });
+        assert_eq!(
+            selected,
+            [LineSelection::of(&diff.hunks[0].lines[2]).unwrap()]
+        );
+    }
+
+    #[test]
+    fn the_diff_header_stages_and_unstages_the_file_and_selected_lines() {
+        use crate::shell::test_frame::TestFrames;
+        use imgit_git::repository::DiffOptions;
+
+        let (_scratch, _repo, mut app, _) =
+            diff_fixture("one\nkeep\nthree\n", "ONE\nkeep\nTHREE\n");
+        let mut frames = TestFrames::new();
+        let size = vec2(1180.0, 560.0);
+        app.with_active(|app, state| {
+            assert!(state.open_diff(test_target(DiffSource::Unstaged)));
+            let mut stage_file = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    stage_file = cx.cursor() + vec2(size.x - 60.0, 17.5);
+                    draw_diff_view(cx, app, state, size);
+                });
+            }
+            frames.click_left(stage_file, |cx| draw_diff_view(cx, app, state, size));
+            assert_eq!(
+                state.diff_target.as_ref().unwrap().source,
+                DiffSource::Staged
+            );
+            assert_eq!(state.status.staged.len(), 1);
+            assert!(state.status.unstaged.is_empty());
+            frames.click_left(stage_file, |cx| draw_diff_view(cx, app, state, size));
+            assert_eq!(
+                state.diff_target.as_ref().unwrap().source,
+                DiffSource::Unstaged
+            );
+            assert!(state.status.staged.is_empty());
+
+            let diff = state.diff.as_ref().unwrap();
+            state.diff_selection_revision = diff.revision;
+            state.diff_selected_lines = diff
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .filter_map(LineSelection::of)
+                .filter(|line| line.lineno == 1)
+                .collect();
+            assert_eq!(state.diff_selected_lines.len(), 2);
+            let mut stage_lines = Vec2::ZERO;
+            frames.draw(|cx| {
+                let file_width = cx
+                    .text_size(cx.fonts.regular, FONT_SIZE_ROW, "Stage File")
+                    .x
+                    + 12.0;
+                stage_lines = cx.cursor() + vec2(size.x - 40.0 - file_width - 8.0 - 30.0, 17.5);
+                draw_diff_view(cx, app, state, size);
+            });
+            frames.click_left(stage_lines, |cx| draw_diff_view(cx, app, state, size));
+            assert!(state.diff_selected_lines.is_empty());
+            assert_eq!(state.status.staged.len(), 1);
+            assert_eq!(state.status.unstaged.len(), 1);
+
+            let changes = |staged| {
+                state
+                    .repo
+                    .workdir_file_diff("file.txt", staged, DiffOptions::default())
+                    .unwrap()
+                    .hunks
+                    .into_iter()
+                    .flat_map(|hunk| hunk.lines)
+                    .filter(|line| line.origin == LineOrigin::Added)
+                    .map(|line| line.text)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(changes(true), ["ONE"]);
+            assert_eq!(changes(false), ["THREE"]);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn diff_modes_and_display_options_reload_and_save_the_expected_view() {
+        use crate::app::settings::Settings;
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, _repo, mut app, _) = diff_fixture(
+            "one\na b\nkeep\nold\n",
+            "one\na  b\nkeep\na changed line with several words to wrap\n",
+        );
+        let size = vec2(1180.0, 560.0);
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.diff_mode = DiffMode::Hunk;
+            state.diff_whitespace = true;
+            app.settings.diff_whitespace = true;
+            app.settings.word_wrap = false;
+            assert!(state.open_diff(test_target(DiffSource::Unstaged)));
+            let added = |state: &RepoState| {
+                state
+                    .diff
+                    .as_ref()
+                    .unwrap()
+                    .hunks
+                    .iter()
+                    .flat_map(|hunk| &hunk.lines)
+                    .filter(|line| line.origin == LineOrigin::Added)
+                    .map(|line| line.text.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(added(state).len(), 2);
+
+            let mut tools = [Vec2::ZERO; TOOL_BUTTONS.len()];
+            let mut file_view = Vec2::ZERO;
+            let mut diff_view = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    tools = diff_tool_positions(cx, size);
+                    let origin = cx.cursor();
+                    let side_width = toggle_width(cx, Some("Unstaged"), None) + 10.0;
+                    let file_width = toggle_width(cx, Some("File View"), None);
+                    let diff_width = toggle_width(cx, Some("Diff View"), None);
+                    let view_x = ((size.x - side_width - file_width - diff_width) / 2.0).round();
+                    file_view =
+                        origin + vec2(view_x + side_width + file_width / 2.0, HEADER_H + 20.0);
+                    diff_view = origin
+                        + vec2(
+                            view_x + side_width + file_width + diff_width / 2.0,
+                            HEADER_H + 20.0,
+                        );
+                    draw_diff_view(cx, app, state, size);
+                });
+            }
+            let pick = |frames: &mut TestFrames,
+                        app: &mut Application,
+                        state: &mut RepoState,
+                        tool: Tool| {
+                let index = TOOL_BUTTONS
+                    .iter()
+                    .position(|button| button.tool == tool)
+                    .unwrap();
+                frames.click_left(tools[index], |cx| draw_diff_view(cx, app, state, size));
+            };
+            frames.click_left(file_view, |cx| draw_diff_view(cx, app, state, size));
+            assert!(state.file_view);
+            frames.click_left(diff_view, |cx| draw_diff_view(cx, app, state, size));
+            assert!(!state.file_view);
+            for (tool, mode) in [
+                (Tool::Inline, DiffMode::Inline),
+                (Tool::Split, DiffMode::Split),
+                (Tool::Hunk, DiffMode::Hunk),
+            ] {
+                pick(&mut frames, app, state, tool);
+                assert_eq!(state.diff_mode, mode);
+            }
+
+            pick(&mut frames, app, state, Tool::Whitespace);
+            assert!(!state.diff_whitespace);
+            assert_eq!(added(state), ["a changed line with several words to wrap"]);
+            pick(&mut frames, app, state, Tool::Wrap);
+            let mut stored = Settings::default();
+            stored.load(&app.config_path("settings.txt"));
+            assert!(stored.word_wrap);
+            assert!(!stored.diff_whitespace);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn diff_history_and_blame_follow_the_target_and_closing_a_dirty_editor_asks_first() {
+        use crate::app::dialog::DialogKind;
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, repo, mut app, base) = diff_fixture("first\n", "working text\n");
+        let size = vec2(1180.0, 560.0);
+        let mut frames = TestFrames::new();
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| draw_diff_view(cx, app, state, size))
+                .unwrap();
+        };
+        assert!(app.active_mut().unwrap().open_diff(DiffTarget {
+            source: DiffSource::Commit(base.clone()),
+            status: FileStatus::Added,
+            ..test_target(DiffSource::Unstaged)
+        }));
+        let mut tools = [Vec2::ZERO; TOOL_BUTTONS.len()];
+        let mut origin = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                tools = diff_tool_positions(cx, size);
+                draw(cx, &mut app);
+            });
+        }
+
+        frames.click_left(tools[0], |cx| draw(cx, &mut app));
+        let view = app.active().unwrap().file_history.as_ref().unwrap();
+        assert_eq!(view.path, "file.txt");
+        assert_eq!(view.from.as_deref(), Some(base.as_str()));
+        assert_eq!(view.selected_sha.as_deref(), Some(base.as_str()));
+        assert!(view.blame);
+        let state = app.active_mut().unwrap();
+        state.close_file_history();
+        assert!(state.open_diff(test_target(DiffSource::Unstaged)));
+        frames.click_left(tools[1], |cx| draw(cx, &mut app));
+        let view = app.active().unwrap().file_history.as_ref().unwrap();
+        assert_eq!(view.path, "file.txt");
+        assert_eq!(view.from, None);
+        assert!(!view.blame);
+
+        let state = app.active_mut().unwrap();
+        state.close_file_history();
+        assert!(state.open_diff(test_target(DiffSource::Unstaged)));
+        frames.click_left(origin + vec2(55.0, HEADER_H + 20.0), |cx| {
+            draw(cx, &mut app)
+        });
+        let editor = app.active().unwrap().file_edit.as_ref().unwrap();
+        assert_eq!(editor.text, "working text\n");
+        for _ in 0..2 {
+            frames.draw(|cx| draw(cx, &mut app));
+        }
+        frames.type_text("unsaved text");
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!(app.active().unwrap().has_unsaved_edit());
+        frames.click_left(origin + vec2(size.x - 20.0, 17.5), |cx| draw(cx, &mut app));
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert!(app.active().unwrap().has_unsaved_edit());
+
+        let discard = app.dialog.on_confirm.take().unwrap();
+        app.dialog.close();
+        frames.draw(|cx| discard(cx, &mut app));
+        let state = app.active().unwrap();
+        assert!(state.file_edit.is_none());
+        assert!(state.diff_target.is_none());
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join("file.txt")).unwrap(),
+            "working text\n"
+        );
+    }
+
+    fn diff_fixture(
+        before: &str,
+        after: &str,
+    ) -> (
+        tempfile::TempDir,
+        imgit_git::Repository,
+        Application,
+        String,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Diff controls test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("diff@example.invalid"))
+            .unwrap();
+        repo.set_local_config("core.autocrlf", Some("false"))
+            .unwrap();
+        let file = repo.workdir().join("file.txt");
+        std::fs::write(&file, before).unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let base = repo.commit("Base", false).unwrap();
+        std::fs::write(&file, after).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, repo, app, base)
+    }
+
+    fn test_target(source: DiffSource) -> DiffTarget {
+        DiffTarget {
+            source,
+            path: "file.txt".to_owned(),
+            status: FileStatus::Modified,
+        }
+    }
+
+    fn diff_tool_positions(cx: &Cx<'_>, size: Vec2) -> [Vec2; TOOL_BUTTONS.len()] {
+        let widths = TOOL_BUTTONS
+            .iter()
+            .map(|button| cx.px(button.gap) + toggle_width(cx, button.label, button.icon))
+            .collect::<Vec<_>>();
+        let origin = cx.cursor();
+        let mut x = origin.x + size.x - cx.px(10.0) - widths.iter().sum::<f32>();
+        std::array::from_fn(|index| {
+            let width = widths[index];
+            let margin = cx.px(TOOL_BUTTONS[index].gap);
+            let center = x + (width + margin) / 2.0;
+            x += width;
+            vec2(center, origin.y + cx.px(HEADER_H + 20.0))
+        })
+    }
+
+    #[test]
+    fn staging_a_hunk_from_the_file_view_leaves_other_hunks_unstaged() {
+        use crate::shell::test_frame::TestFrames;
+        use imgit_git::{Repository, repository::DiffOptions};
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Diff test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("diff@example.invalid"))
+            .unwrap();
+        let path = "file.rs";
+        let file = repo.workdir().join(path);
+        let before: String = (1..=30).map(|line| format!("// line {line}\n")).collect();
+        std::fs::write(&file, &before).unwrap();
+        repo.stage(&[path]).unwrap();
+        repo.commit("Add file", false).unwrap();
+        let after = before
+            .replace("// line 2\n", "let first = 20;\n")
+            .replace("// line 25\n", "let second = 25;\n");
+        std::fs::write(&file, after).unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.diff_mode = DiffMode::Hunk;
+            assert!(state.open_diff(DiffTarget {
+                source: DiffSource::Unstaged,
+                path: path.to_owned(),
+                status: FileStatus::Modified,
+            }));
+            assert_eq!(state.diff.as_ref().unwrap().hunks.len(), 2);
+
+            let size = vec2(1180.0, 520.0);
+            let mut hunk_button = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    // In a wide pane the toolbar takes one row. Click the first hunk's
+                    // action near the right edge, before the overview ruler.
+                    hunk_button = cx.cursor()
+                        + vec2(
+                            size.x - DIFF_RULER_W - 30.0,
+                            HEADER_H + TOOLBAR_H + cx.px(code_style(cx).line_h) / 2.0,
+                        );
+                    draw_diff_view(cx, app, state, size);
+                });
+            }
+            frames.click_left(hunk_button, |cx| draw_diff_view(cx, app, state, size));
+            let added = |staged| {
+                state
+                    .repo
+                    .workdir_file_diff(path, staged, DiffOptions::default())
+                    .unwrap()
+                    .hunks
+                    .into_iter()
+                    .flat_map(|hunk| hunk.lines)
+                    .filter(|line| line.origin == LineOrigin::Added)
+                    .map(|line| line.text)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(added(true), ["let first = 20;"]);
+            assert_eq!(added(false), ["let second = 25;"]);
+
+            let mut split_button = Vec2::ZERO;
+            frames.draw(|cx| {
+                let width = |button: &ToolButton| {
+                    cx.px(button.gap) + toggle_width(cx, button.label, button.icon)
+                };
+                let after_split = TOOL_BUTTONS
+                    .iter()
+                    .rev()
+                    .take_while(|button| button.tool != Tool::Split);
+                let split = TOOL_BUTTONS
+                    .iter()
+                    .find(|button| button.tool == Tool::Split)
+                    .unwrap();
+                split_button = cx.cursor()
+                    + vec2(
+                        size.x - 10.0 - after_split.map(width).sum::<f32>() - width(split) / 2.0,
+                        HEADER_H + 20.0,
+                    );
+                draw_diff_view(cx, app, state, size);
+            });
+            frames.click_left(split_button, |cx| draw_diff_view(cx, app, state, size));
+            assert_eq!(state.diff_mode, DiffMode::Split);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn clicking_wrapped_blame_returns_the_commit_for_that_line() {
+        use crate::shell::test_frame::TestFrames;
+
+        let mut diff = sample();
+        diff.path = "sample.rs".to_owned();
+        diff.hunks[0].lines[2].text = "let ".to_owned() + &"identifier_".repeat(20) + " = 1;";
+        let blame = Blame {
+            hunks: vec![
+                BlameHunk {
+                    start_line: 1,
+                    line_count: 1,
+                    sha: "111111".to_owned(),
+                    summary: "Base".to_owned(),
+                    ..BlameHunk::default()
+                },
+                BlameHunk {
+                    start_line: 2,
+                    line_count: 3,
+                    sha: "222222".to_owned(),
+                    summary: "Update".to_owned(),
+                    ..BlameHunk::default()
+                },
+            ],
+        };
+        let mut frames = TestFrames::new();
+        let mut click_at = Vec2::ZERO;
+        let mut clicked = None;
+        let draw = |cx: &mut Cx<'_>, clicked: &mut Option<String>| {
+            let min = cx.cursor();
+            let mut options = DiffEditorOptions {
+                file_view: true,
+                blame_gutter: true,
+                blame_columns: true,
+                blame: Some(&blame),
+                word_wrap: true,
+                ..DiffEditorOptions::default()
+            };
+            if let Some(hit) = draw_diff_editor(
+                cx,
+                Some(&diff),
+                "",
+                min,
+                min + vec2(520.0, 240.0),
+                &mut options,
+            ) {
+                *clicked = Some(hit.sha.clone());
+            }
+            // The third visual row is a continuation of the second source line.
+            min + vec2(BLAME_AVATAR_X, cx.px(code_style(cx).line_h) * 2.5)
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| click_at = draw(cx, &mut clicked));
+        }
+        frames.click_left(click_at, |cx| {
+            draw(cx, &mut clicked);
+        });
+        assert_eq!(clicked.as_deref(), Some("222222"));
+    }
+
+    #[test]
     fn the_anchor_does_not_survive_a_reload_of_the_diff() {
         let (first, second) = (Revision::next(), Revision::next());
         let mut memory = EditorMemory::default();

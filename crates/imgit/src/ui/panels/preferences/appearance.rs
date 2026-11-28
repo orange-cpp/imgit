@@ -373,6 +373,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn color_and_column_controls_save_their_choices_and_reset_existing_groups() {
+        use crate::app::application::Application;
+        use crate::app::settings::Settings;
+        use crate::shell::test_frame::TestFrames;
+        use crate::ui::{Cx, Vec2};
+        use dear_imgui_rs::Key;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let config = scratch.path().join("config");
+        let mut app = Application::with_config_directory(config.clone());
+        app.settings.remember_tabs = true;
+        for name in ["One", "Two"] {
+            let repo = imgit_git::Repository::init(scratch.path().join(name)).unwrap();
+            app.open_repository(&repo.workdir().to_string_lossy());
+            app.set_tab_group(app.active_tab.unwrap(), Some(name));
+        }
+        let old_colors: Vec<_> = app.tab_groups.iter().map(|group| group.color).collect();
+        assert_ne!(old_colors[0], old_colors[1]);
+        let mut frames = TestFrames::new();
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            let origin = cx.cursor();
+            let draw = cx.window_draw_list();
+            let mut page = Page::new(cx, app, draw, origin, 900.0);
+            let mut form = Form::new(&page);
+            let control = form.control_x();
+            let color = page.at(control + 80.0, 17.0);
+            let reset = page.at(control + 245.0, 17.0);
+            row(&mut page, &mut form, "Tab Group Color", |page, r| {
+                color_row(page, r, "##colors", "Reset group colors");
+            });
+            let checkbox = page.at(control + 6.0, form.place(0.0) + 16.0);
+            row(&mut page, &mut form, "Ref Column", |page, r| {
+                column_checkbox(page, r, "##ref", "ref");
+            });
+            crate::ui::menu::draw_menus(cx, app);
+            (color, reset, checkbox)
+        };
+        let mut points = (Vec2::ZERO, Vec2::ZERO, Vec2::ZERO);
+        for _ in 0..2 {
+            frames.draw(|cx| points = draw(cx, &mut app));
+        }
+        frames.click_left(points.0, |cx| {
+            draw(cx, &mut app);
+        });
+        for _ in 0..4 {
+            frames.set_key(Key::DownArrow, true);
+            frames.draw(|cx| {
+                draw(cx, &mut app);
+            });
+            frames.set_key(Key::DownArrow, false);
+            frames.draw(|cx| {
+                draw(cx, &mut app);
+            });
+        }
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| {
+            draw(cx, &mut app);
+        });
+        frames.set_key(Key::Enter, false);
+        assert_eq!(app.settings.tab_group_color, Some(2));
+        assert_eq!(
+            app.tab_groups
+                .iter()
+                .map(|group| group.color)
+                .collect::<Vec<_>>(),
+            old_colors
+        );
+
+        frames.draw(|cx| {
+            draw(cx, &mut app);
+        });
+        frames.click_left(points.1, |cx| {
+            draw(cx, &mut app);
+        });
+        assert!(app.tab_groups.iter().all(|group| group.color == 2));
+        frames.click_left(points.2, |cx| {
+            draw(cx, &mut app);
+        });
+        let mut stored = Settings::default();
+        stored.load(&app.config_path("settings.txt"));
+        assert!(stored.hidden_graph_columns.contains("ref"));
+
+        frames.click_left(points.2, |cx| {
+            draw(cx, &mut app);
+        });
+        stored.load(&app.config_path("settings.txt"));
+        assert!(!stored.hidden_graph_columns.contains("ref"));
+        assert_eq!(stored.tab_group_color, Some(2));
+
+        let mut reopened = Application::with_config_directory(config);
+        reopened.restore_tabs();
+        assert_eq!(reopened.tab_groups.len(), 2);
+        assert!(reopened.tab_groups.iter().all(|group| group.color == 2));
+    }
+
+    #[test]
     fn group_colour_names() {
         assert_eq!(group_color_name(None), "Next color");
         assert_eq!(group_color_name(Some(0)), "Lane color 1");

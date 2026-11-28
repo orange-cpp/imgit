@@ -216,3 +216,118 @@ impl Repository {
         Ok(self.repo.remote_delete(name)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repository::tests::ScratchRepository;
+
+    #[test]
+    fn checking_out_remote_creates_tracking_branch_and_safely_fast_forwards() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        repo.create_branch("fixture", &base, true).unwrap();
+        let update = scratch.commit_file("tracked.txt", b"update\n", "Upstream change");
+        repo.checkout_branch("main").unwrap();
+        repo.add_remote("origin", ".").unwrap();
+        scratch.remote_tip("origin/topic", &base);
+
+        repo.checkout_remote_branch("origin", "topic").unwrap();
+        assert_eq!(repo.repo.head().unwrap().shorthand().unwrap(), "topic");
+        assert_eq!(
+            repo.repo
+                .branch_upstream_name("refs/heads/topic")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "refs/remotes/origin/topic",
+        );
+        assert!(!repo.upstream_gone("topic"));
+        assert!(!repo.upstream_gone("main"));
+
+        scratch.remote_tip("origin/topic", &update);
+        scratch.write("tracked.txt", b"local edits\n");
+        assert!(repo.checkout_remote_branch("origin", "topic").is_err());
+        assert_eq!(
+            repo.head_commit().unwrap().unwrap().id(),
+            parse_oid(&base).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(repo.workdir().join("tracked.txt")).unwrap(),
+            b"local edits\n"
+        );
+
+        scratch.write("tracked.txt", b"base\n");
+        repo.checkout_remote_branch("origin", "topic").unwrap();
+        assert_eq!(
+            repo.head_commit().unwrap().unwrap().id(),
+            parse_oid(&update).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(repo.workdir().join("tracked.txt")).unwrap(),
+            b"update\n"
+        );
+
+        repo.repo
+            .find_reference("refs/remotes/origin/topic")
+            .unwrap()
+            .delete()
+            .unwrap();
+        assert!(repo.upstream_gone("topic"));
+    }
+
+    #[test]
+    fn default_branch_prefers_the_remote_default_then_gitflow() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        assert_eq!(repo.default_branch("origin"), None);
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        assert_eq!(repo.default_branch("origin").as_deref(), Some("main"));
+        repo.create_branch("production", &base, false).unwrap();
+        repo.set_local_config("gitflow.branch.master", Some("production"))
+            .unwrap();
+        assert_eq!(repo.default_branch("origin").as_deref(), Some("production"));
+        repo.create_branch("trunk", &base, false).unwrap();
+        scratch.remote_tip("origin/trunk", &base);
+        repo.repo
+            .reference_symbolic(
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+                false,
+                "test: set remote default",
+            )
+            .unwrap();
+        assert_eq!(repo.default_branch("origin").as_deref(), Some("trunk"));
+        repo.delete_branch("trunk").unwrap();
+        assert_eq!(repo.default_branch("origin").as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn detects_branches_checked_out_in_linked_worktrees() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        repo.create_branch("linked", &base, false).unwrap();
+        repo.create_branch("unused", &base, false).unwrap();
+        assert!(repo.branch_checked_out("main"));
+        assert!(!repo.branch_checked_out("linked"));
+        assert!(!repo.branch_checked_out("missing"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("linked");
+        let reference = repo.repo.find_reference("refs/heads/linked").unwrap();
+        repo.repo
+            .worktree(
+                "linked",
+                &path,
+                Some(git2::WorktreeAddOptions::new().reference(Some(&reference))),
+            )
+            .unwrap();
+        assert!(repo.branch_checked_out("linked"));
+        assert!(!repo.branch_checked_out("unused"));
+        let linked = Repository::open(path).unwrap();
+        assert!(linked.branch_checked_out("main"));
+        assert!(linked.branch_checked_out("linked"));
+    }
+}

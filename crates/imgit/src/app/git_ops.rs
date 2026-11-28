@@ -651,6 +651,123 @@ mod tests {
         }
     }
 
+    fn cloned_local_repo() -> (tempfile::TempDir, Repository, Application, String) {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = Repository::init(scratch.path().join("source")).unwrap();
+        source
+            .set_local_config("user.name", Some("Remote test"))
+            .unwrap();
+        source
+            .set_local_config("user.email", Some("remote-test@example.invalid"))
+            .unwrap();
+        let base = source.commit("Initial commit", false).unwrap();
+        let target = scratch.path().join("target");
+        let source_path = source.workdir().to_string_lossy();
+        let target_path = target.to_string_lossy();
+        let output = cli::run(
+            scratch.path(),
+            ["clone", "--", &source_path, &target_path],
+            cli::RunOptions::default(),
+        );
+        assert!(output.success(), "{}", output.text);
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&target_path);
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(base.as_str())
+        );
+        (scratch, source, app, base)
+    }
+
+    fn wait_for_operation(app: &mut Application) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Git operation did not finish"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn auto_fetch_waits_for_its_interval_and_refreshes_remote_refs_silently() {
+        let (_scratch, source, mut app, base) = cloned_local_repo();
+        let branch_tip = source.commit("Remote-only update", false).unwrap();
+        source
+            .create_branch("remote-only", &branch_tip, false)
+            .unwrap();
+        app.settings.auto_fetch_minutes = 0;
+        app.with_active(|app, state| {
+            app.auto_fetch(5.0, state);
+            assert_eq!(state.last_auto_fetch, 0.0);
+            assert!(!state.busy());
+            app.settings.auto_fetch_minutes = 1;
+            app.auto_fetch(10.0, state);
+            app.auto_fetch(69.0, state);
+            assert_eq!(state.last_auto_fetch, 10.0);
+            assert!(!state.busy());
+            assert!(state.find_ref("refs/remotes/origin/remote-only").is_none());
+
+            state.async_op = Some(running("Push"));
+            app.auto_fetch(70.0, state);
+            assert_eq!(state.async_op.as_ref().unwrap().title, "Push");
+            assert_eq!(state.last_auto_fetch, 10.0);
+            state.async_op = None;
+
+            app.auto_fetch(70.0, state);
+            let operation = state.async_op.as_ref().unwrap();
+            assert_eq!(operation.title, "Auto-fetch");
+            assert!(operation.silent);
+            assert_eq!(state.last_auto_fetch, 70.0);
+        })
+        .unwrap();
+        wait_for_operation(&mut app);
+        let state = app.active().unwrap();
+        assert_eq!(
+            state
+                .find_ref("refs/remotes/origin/remote-only")
+                .unwrap()
+                .target,
+            branch_tip
+        );
+        assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+        assert!(app.toasts.history().is_empty());
+    }
+
+    #[test]
+    fn pull_reports_an_unchanged_branch_then_updates_it_after_the_remote_moves() {
+        let (_scratch, source, mut app, base) = cloned_local_repo();
+        let upstream = app
+            .active()
+            .unwrap()
+            .head_ref()
+            .unwrap()
+            .upstream
+            .clone()
+            .unwrap();
+        app.with_active(|app, state| app.run_git_cli(state, "Pull", ["pull", "--ff-only"]))
+            .unwrap();
+        wait_for_operation(&mut app);
+        assert_eq!(app.toasts.history()[0].title, "Already Up-to-Date");
+        assert!(app.toasts.history()[0].detail.contains(&upstream));
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(base.as_str())
+        );
+
+        let tip = source.commit("Remote update", false).unwrap();
+        app.with_active(|app, state| app.run_git_cli(state, "Pull", ["pull", "--ff-only"]))
+            .unwrap();
+        wait_for_operation(&mut app);
+        assert_eq!(app.toasts.history()[0].title, "Pulled Successfully");
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(tip.as_str())
+        );
+    }
+
     #[test]
     fn changes_wait_for_the_git_command_running_on_the_repository() {
         let scratch = tempfile::tempdir().unwrap();

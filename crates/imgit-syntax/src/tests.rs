@@ -1,6 +1,6 @@
 //! The highlighter's behaviour.
 
-use imgit_syntax::{
+use crate::{
     Diff, DiffCache, DiffLine, DiffSpans, Language, LimitExceeded, LineKind, LineSpans,
     MAX_LINE_LENGTH, MAX_LINES, Span, State, TextCache, Token, fingerprint_diff, fingerprint_lines,
     tokenize_diff, tokenize_line, tokenize_lines,

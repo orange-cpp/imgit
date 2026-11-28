@@ -604,3 +604,197 @@ impl Application {
             });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dear_imgui_rs::Key;
+    use imgit_git::Repository;
+
+    use crate::shell::test_frame::TestFrames;
+
+    fn repository() -> (tempfile::TempDir, Application, String, [String; 2]) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Frame test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("frame@example.invalid"))
+            .unwrap();
+        let first = repo.commit("Needle first", false).unwrap();
+        let second = repo.commit("Needle second", false).unwrap();
+        let head = repo.commit("Head", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, app, head, [first, second])
+    }
+
+    fn keystroke(frames: &mut TestFrames, app: &mut Application, keys: &[Key]) {
+        for &key in keys {
+            frames.set_key(key, true);
+        }
+        frames.draw(|cx| app.draw_frame(cx));
+        for &key in keys.iter().rev() {
+            frames.set_key(key, false);
+        }
+        frames.draw(|cx| app.draw_frame(cx));
+    }
+
+    #[test]
+    fn commit_search_from_the_app_frame_selects_and_wraps_through_matches() {
+        let (_scratch, mut app, _head, [first, second]) = repository();
+        let mut frames = TestFrames::new();
+        for _ in 0..2 {
+            frames.draw(|cx| app.draw_frame(cx));
+        }
+        keystroke(&mut frames, &mut app, &[Key::ModCtrl, Key::F]);
+        assert!(app.active().unwrap().search_open);
+        frames.draw(|cx| app.draw_frame(cx));
+        frames.type_text("needle");
+        frames.draw(|cx| app.draw_frame(cx));
+        let state = app.active().unwrap();
+        assert_eq!(state.search_matches.len(), 2);
+        assert_eq!(state.selected, [second.as_str()]);
+
+        keystroke(&mut frames, &mut app, &[Key::DownArrow]);
+        assert_eq!(app.active().unwrap().selected, [first]);
+        keystroke(&mut frames, &mut app, &[Key::Enter]);
+        assert_eq!(app.active().unwrap().selected, [second]);
+        keystroke(&mut frames, &mut app, &[Key::Escape]);
+        keystroke(&mut frames, &mut app, &[Key::Escape]);
+        let state = app.active().unwrap();
+        assert!(!state.search_open);
+        assert!(state.search_matches.is_empty());
+    }
+
+    #[test]
+    fn the_branch_shortcut_opens_inline_creation_at_the_selected_commit() {
+        let (_scratch, mut app, _head, [first, _]) = repository();
+        app.active_mut().unwrap().select_only(&first);
+        let mut frames = TestFrames::new();
+        for _ in 0..2 {
+            frames.draw(|cx| app.draw_frame(cx));
+        }
+        keystroke(&mut frames, &mut app, &[Key::ModCtrl, Key::B]);
+        let inline = app.active().unwrap().inline_ref.as_ref().unwrap();
+        assert_eq!(inline.sha, first);
+        assert!(inline.checkout);
+        assert!(!app.dialog.is_open());
+        for _ in 0..2 {
+            frames.draw(|cx| app.draw_frame(cx));
+        }
+
+        frames.type_text("-bad");
+        frames.draw(|cx| app.draw_frame(cx));
+        keystroke(&mut frames, &mut app, &[Key::Enter]);
+        let state = app.active().unwrap();
+        assert_eq!(state.inline_ref.as_ref().unwrap().name, "-bad");
+        assert!(state.find_ref("refs/heads/-bad").is_none());
+
+        frames.draw(|cx| app.draw_frame(cx));
+        for _ in "-bad".chars() {
+            keystroke(&mut frames, &mut app, &[Key::Backspace]);
+        }
+        frames.type_text("topic/inline");
+        frames.draw(|cx| app.draw_frame(cx));
+        assert_eq!(
+            app.active().unwrap().inline_ref.as_ref().unwrap().name,
+            "topic/inline"
+        );
+        keystroke(&mut frames, &mut app, &[Key::Enter]);
+        let state = app.active().unwrap();
+        assert!(state.inline_ref.is_none());
+        assert_eq!(state.history.head_branch.as_deref(), Some("topic/inline"));
+        assert_eq!(state.history.head_sha.as_deref(), Some(first.as_str()));
+        assert_eq!(
+            state.find_ref("refs/heads/topic/inline").unwrap().target,
+            first
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn alt_menu_mnemonics_open_view_and_dispatch_its_zoom_action() {
+        let (_scratch, mut app, _, _) = repository();
+        app.settings.zoom = 1.0;
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            cx.request_theme("ImGit Light");
+            app.draw_frame(cx);
+        });
+
+        frames.set_key(Key::ModAlt, true);
+        frames.set_key(Key::V, true);
+        frames.draw(|cx| {
+            assert!(cx.palette.light);
+            app.draw_frame(cx);
+            assert_eq!(open_bar_menu(cx), Some(2));
+            assert!(menu_keyboard_mode(cx));
+        });
+        frames.set_key(Key::V, false);
+        frames.set_key(Key::ModAlt, false);
+        frames.draw(|cx| app.draw_frame(cx));
+        frames.set_key(Key::I, true);
+        frames.draw(|cx| {
+            app.draw_frame(cx);
+            assert!(!menu_open(cx));
+        });
+        assert_eq!(app.settings.zoom, 1.1);
+        let mut saved = crate::app::settings::Settings::default();
+        saved.load(&app.config_path("settings.txt"));
+        assert_eq!(saved.zoom, 1.1);
+    }
+
+    #[test]
+    fn the_status_bar_opens_and_closes_the_about_dialog() {
+        let (_scratch, mut app, _, _) = repository();
+        let mut frames = TestFrames::new();
+        let mut version = Vec2::ZERO;
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.draw_status_bar(cx);
+            dialogs::draw_dialogs(cx, app);
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                version = cx.cursor() + vec2(cx.avail().x - 22.0, 12.0);
+                draw(cx, &mut app);
+            });
+        }
+        frames.click_left(version, |cx| draw(cx, &mut app));
+        assert!(app.dialog.is(DialogKind::About));
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!(!app.dialog.is_open());
+        assert!(app.active_workdir().is_some());
+    }
+
+    #[test]
+    fn dragging_the_repository_sidebar_saves_its_new_width_on_release() {
+        let (_scratch, mut app, _, _) = repository();
+        app.settings.left_panel_width = 240.0;
+        let mut frames = TestFrames::new();
+        let size = vec2(1240.0, 650.0);
+        app.with_active(|app, state| {
+            let mut handle = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    handle = cx.cursor() + vec2(app.settings.left_panel_width, 280.0);
+                    app.draw_repo_tab(cx, state, size);
+                });
+            }
+            frames.move_mouse(handle.into());
+            frames.draw(|cx| app.draw_repo_tab(cx, state, size));
+            frames.set_left_mouse(true);
+            frames.draw(|cx| app.draw_repo_tab(cx, state, size));
+            frames.move_mouse((handle + vec2(50.0, 0.0)).into());
+            frames.draw(|cx| app.draw_repo_tab(cx, state, size));
+            assert_eq!(app.settings.left_panel_width, 290.0);
+            frames.set_left_mouse(false);
+            frames.draw(|cx| app.draw_repo_tab(cx, state, size));
+
+            let mut saved = crate::app::settings::Settings::default();
+            saved.load(&app.config_path("settings.txt"));
+            assert_eq!(saved.left_panel_width, 290.0);
+        })
+        .unwrap();
+    }
+}

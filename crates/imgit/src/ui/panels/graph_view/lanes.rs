@@ -407,6 +407,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fading_a_node_leaves_the_vertices_drawn_before_it_unchanged() {
+        use crate::shell::test_frame::TestFrames;
+
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let draw = cx.window_draw_list();
+            fade_vertices(draw, draw.vertex_count(), 0.5);
+            let start = draw.vertex_count();
+            let ink = Color::from_rgba8(4, 18, 110, 200);
+            draw.add_rect_filled(vec2(35.0, 40.0), vec2(55.0, 60.0), ink, 0.0);
+            let node = draw.vertex_count();
+            draw.add_rect_filled(vec2(60.0, 40.0), vec2(80.0, 60.0), ink, 0.0);
+            let end = draw.vertex_count();
+            fade_vertices(draw, node, 1.0);
+            assert!(
+                vertices(draw)[start..end]
+                    .iter()
+                    .all(|vertex| vertex.col >> 24 == 200)
+            );
+
+            fade_vertices(draw, node, 0.25);
+            let drawn = vertices(draw);
+            assert!(
+                drawn[start..node]
+                    .iter()
+                    .all(|vertex| vertex.col >> 24 == 200)
+            );
+            assert!(drawn[node..end].iter().all(|vertex| vertex.col >> 24 == 50));
+            assert!(
+                drawn[start..end]
+                    .iter()
+                    .all(|vertex| vertex.col & 0x00ff_ffff == 0x006e_1204)
+            );
+        });
+    }
+
+    #[test]
+    fn dashed_edges_keep_their_phase_across_segments_and_gutter_shadows_fade_outwards() {
+        use crate::shell::test_frame::TestFrames;
+
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let draw = cx.window_draw_list();
+            let start = draw.vertex_count();
+            stroke_path(
+                draw,
+                &[
+                    vec2(42.0, 50.0),
+                    vec2(42.0, 53.0),
+                    vec2(42.0, 53.0),
+                    vec2(42.0, 58.0),
+                ],
+                Color::WHITE,
+                2.0,
+                true,
+                2.0,
+            );
+            let dashes = &vertices(draw)[start..];
+            assert_eq!(dashes.len(), 8);
+            let vertical = |quad: &[dear_imgui_rs::sys::ImDrawVert]| {
+                let min = quad
+                    .iter()
+                    .map(|vertex| vertex.pos.y)
+                    .fold(f32::INFINITY, f32::min);
+                let max = quad
+                    .iter()
+                    .map(|vertex| vertex.pos.y)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                (min as i32, max as i32)
+            };
+            assert_eq!(vertical(&dashes[..4]), (50, 52));
+            assert_eq!(vertical(&dashes[4..]), (54, 56));
+
+            for direction in [-1.0, 1.0] {
+                let start = draw.vertex_count();
+                gutter_shadow(draw, 1.0, 100.0, direction, 68.0, 92.0, 0.6);
+                let copy = vertices(draw);
+                let shadow = &copy[start..];
+                assert!(shadow.len() >= 8);
+                assert!(shadow[0].col >> 24 > shadow.last().unwrap().col >> 24);
+                assert!(
+                    shadow
+                        .iter()
+                        .all(|vertex| (vertex.pos.x - 100.0) * direction >= 0.0)
+                );
+            }
+        });
+    }
+
+    fn vertices(draw: DrawList<'_>) -> Vec<dear_imgui_rs::sys::ImDrawVert> {
+        let count = draw.vertex_count();
+        if count == 0 {
+            return Vec::new();
+        }
+        // SAFETY: the live draw list owns initialized vertices, and the test inspects a copy.
+        unsafe {
+            let buffer = &(*draw.raw()).VtxBuffer;
+            std::slice::from_raw_parts(buffer.Data, count).to_vec()
+        }
+    }
+
+    #[test]
     fn erfc_matches_known_values() {
         assert!((erfc(0.0) - 1.0).abs() < 1e-6);
         assert!((erfc(1.0) - 0.157_299_2).abs() < 1e-5);

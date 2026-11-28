@@ -1703,6 +1703,456 @@ mod tests {
     }
 
     #[test]
+    fn opening_tags_from_the_sidebar_strip_lets_a_tag_select_its_commit() {
+        use crate::shell::test_frame::TestFrames;
+        use imgit_git::Repository;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Sidebar test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("sidebar@example.invalid"))
+            .unwrap();
+        let tagged = repo.commit("Tag target", false).unwrap();
+        let head = repo.commit("Head", false).unwrap();
+        repo.create_tag("v1.0", &tagged, None).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.settings
+            .hidden_left_sections
+            .extend(["Remote".to_owned(), "Worktrees".to_owned()]);
+        app.show_left_panel = false;
+        app.open_repository(&repo.workdir().to_string_lossy());
+
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.select_only(&head);
+            let draw = |frames: &mut TestFrames, app: &mut Application, state: &mut RepoState| {
+                let mut origin = Vec2::default();
+                frames.draw(|cx| {
+                    origin = cx.cursor();
+                    let width = if app.show_left_panel { 260.0 } else { 36.0 };
+                    draw_left_panel(cx, app, state, vec2(width, 600.0), app.show_left_panel);
+                });
+                origin
+            };
+
+            draw(&mut frames, app, state);
+            let origin = draw(&mut frames, app, state);
+            // After the expand button and Local row comes the Tags row.
+            frames.move_mouse((origin + vec2(17.0, 30.0 + 1.5 * 36.0)).into());
+            draw(&mut frames, app, state);
+            frames.set_left_mouse(true);
+            draw(&mut frames, app, state);
+            frames.set_left_mouse(false);
+            draw(&mut frames, app, state);
+            assert!(app.show_left_panel);
+            assert!(state.expanded_left_sections.contains("Tags"));
+
+            draw(&mut frames, app, state);
+            // The first tag is below the filter and the Local and Tags headers.
+            frames.move_mouse(
+                (origin + vec2(110.0, 63.0 + 2.0 * HEADER_HEIGHT + REF_HEIGHT / 2.0)).into(),
+            );
+            draw(&mut frames, app, state);
+            frames.set_left_mouse(true);
+            draw(&mut frames, app, state);
+            assert_eq!(state.left_selected.as_deref(), Some("refs/tags/v1.0"));
+            assert_eq!(
+                state.scroll_to_row,
+                state.history.row_by_sha.get(&tagged).copied()
+            );
+            assert_eq!(state.selected, [tagged]);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_sidebar_folder_eye_changes_only_its_branches_and_the_label_collapses_the_folder() {
+        use crate::shell::test_frame::TestFrames;
+        use imgit_git::Repository;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Sidebar test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("sidebar@example.invalid"))
+            .unwrap();
+        let parent = repo.commit("Base", false).unwrap();
+        for name in ["aaa/one", "aaa/two", "other"] {
+            repo.create_branch(name, &parent, false).unwrap();
+        }
+        repo.commit("Headline", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.expanded_left_sections.insert("Local".to_owned());
+            let size = vec2(330.0, 680.0);
+            let mut first_row = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    first_row = cx.cursor() + vec2(0.0, 63.0 + HEADER_HEIGHT + REF_HEIGHT / 2.0);
+                    draw_left_panel(cx, app, state, size, true);
+                });
+            }
+            let eye = first_row + vec2(12.0, 0.0);
+            frames.click_left(eye, |cx| draw_left_panel(cx, app, state, size, true));
+            for name in ["refs/heads/aaa/one", "refs/heads/aaa/two"] {
+                assert!(state.hidden_refs.contains(name));
+                assert!(state.find_ref(name).unwrap().hidden);
+            }
+            assert!(!state.hidden_refs.contains("refs/heads/other"));
+            assert!(!state.head_ref().unwrap().hidden);
+
+            frames.click_left(first_row + vec2(90.0, 0.0), |cx| {
+                draw_left_panel(cx, app, state, size, true)
+            });
+            assert!(state.collapsed_nodes.contains("local:aaa"));
+            frames.click_left(eye, |cx| draw_left_panel(cx, app, state, size, true));
+            assert!(state.hidden_refs.is_empty());
+            assert!(state.collapsed_nodes.contains("local:aaa"));
+
+            frames.click_left(first_row + vec2(90.0, 0.0), |cx| {
+                draw_left_panel(cx, app, state, size, true)
+            });
+            assert!(!state.collapsed_nodes.contains("local:aaa"));
+            let branch = first_row + vec2(105.0, REF_HEIGHT);
+            frames.click_left(branch, |cx| draw_left_panel(cx, app, state, size, true));
+            assert_eq!(state.left_selected.as_deref(), Some("refs/heads/aaa/one"));
+            assert_eq!(state.selected, [parent]);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn selecting_a_sidebar_stash_jumps_to_its_commit_and_opens_its_context_menu() {
+        use crate::shell::test_frame::TestFrames;
+        use crate::ui::menu::{draw_menus, menu_open};
+        use imgit_git::Repository;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Stash sidebar test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("stash@example.invalid"))
+            .unwrap();
+        let file = repo.workdir().join("file.txt");
+        std::fs::write(&file, "Before\n").unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let head = repo.commit("Base", false).unwrap();
+        std::fs::write(&file, "Working change\n").unwrap();
+        let stash = repo.stash_push("Saved work").unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.settings
+            .hidden_left_sections
+            .extend(["Remote", "Worktrees", "Tags", "Submodules"].map(str::to_owned));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let size = vec2(330.0, 680.0);
+        let mut row = Vec2::ZERO;
+        app.with_active(|app, state| {
+            state.select_only(&head);
+            state.expanded_left_sections.insert("Stashes".to_owned());
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    row = cx.cursor() + vec2(0.0, 63.0 + 2.0 * HEADER_HEIGHT + REF_HEIGHT / 2.0);
+                    draw_left_panel(cx, app, state, size, true);
+                });
+            }
+        })
+        .unwrap();
+
+        let mut open = false;
+        let render = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| draw_left_panel(cx, app, state, size, true))
+                .unwrap();
+            draw_menus(cx, app);
+            menu_open(cx)
+        };
+        frames.click_left(row + vec2(100.0, 0.0), |cx| open = render(cx, &mut app));
+        assert!(!open);
+        let state = app.active().unwrap();
+        assert_eq!(state.left_selected.as_deref(), Some("stash@{0}"));
+        assert_eq!(state.selected, [stash.as_str()]);
+
+        frames.click_left(row + vec2(size.x - 17.0, 0.0), |cx| {
+            open = render(cx, &mut app)
+        });
+        assert!(open);
+        assert_eq!(app.active().unwrap().selected, [stash]);
+    }
+
+    #[test]
+    fn remote_sidebar_menu_fetches_a_local_remote_and_opens_its_editor() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (scratch, repo, mut app, base) = sidebar_repository();
+        let upstream = scratch.path().join("upstream.git");
+        let url = upstream.to_string_lossy();
+        sidebar_git(scratch.path(), &["init", "--bare", &url]);
+        repo.add_remote("origin", &url).unwrap();
+        sidebar_git(
+            repo.workdir(),
+            &["push", "--", "origin", "HEAD:refs/heads/trunk"],
+        );
+        sidebar_git(
+            repo.workdir(),
+            &["update-ref", "-d", "refs/remotes/origin/trunk"],
+        );
+        app.settings
+            .hidden_left_sections
+            .extend(["Worktrees", "Tags", "Submodules"].map(str::to_owned));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        {
+            let state = app.active_mut().unwrap();
+            state.expanded_left_sections.clear();
+            state.expanded_left_sections.insert("Remote".to_owned());
+        }
+        assert!(
+            app.active()
+                .unwrap()
+                .find_ref("refs/remotes/origin/trunk")
+                .is_none()
+        );
+
+        let mut frames = TestFrames::new();
+        let origin = sidebar_origin(&mut frames, &mut app);
+        let section = origin + vec2(307.0, 63.0 + HEADER_HEIGHT + HEADER_HEIGHT / 2.0);
+        frames.click_left(section, |cx| sidebar(cx, &mut app));
+        assert!(app.dialog.is(DialogKind::AddRemote));
+        app.dialog.close();
+
+        let remote = origin + vec2(86.0, 63.0 + 2.0 * HEADER_HEIGHT + REF_HEIGHT / 2.0);
+        open_sidebar_context(&mut frames, &mut app, remote);
+        choose_sidebar_menu(&mut frames, &mut app, 0);
+        let operation = app.active().unwrap().async_op.as_ref().unwrap();
+        assert_eq!(operation.title, "Fetch");
+        assert_eq!(operation.args.first().map(String::as_str), Some("fetch"));
+        assert_eq!(operation.args.last().map(String::as_str), Some("origin"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(std::time::Instant::now() < deadline, "fetch did not finish");
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.active()
+                .unwrap()
+                .find_ref("refs/remotes/origin/trunk")
+                .unwrap()
+                .target,
+            base
+        );
+        open_sidebar_context(&mut frames, &mut app, remote);
+        choose_sidebar_menu(&mut frames, &mut app, 1);
+        assert!(app.dialog.is(DialogKind::EditRemote));
+        assert_eq!(app.dialog.ref_name, "origin");
+        assert_eq!(app.dialog.text_b, url);
+    }
+
+    #[test]
+    fn a_worktree_can_be_opened_from_its_sidebar_row() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (scratch, repo, mut app, base) = sidebar_repository();
+        let worktree = scratch.path().join("review");
+        sidebar_git(
+            repo.workdir(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "review",
+                &worktree.to_string_lossy(),
+            ],
+        );
+        let linked = imgit_git::Repository::open(&worktree).unwrap();
+        app.settings.hidden_left_sections =
+            ["Remote", "Tags", "Submodules"].map(str::to_owned).into();
+        app.open_repository(&repo.workdir().to_string_lossy());
+        {
+            let state = app.active_mut().unwrap();
+            state.expanded_left_sections.clear();
+            state.expanded_left_sections.insert("Worktrees".to_owned());
+            assert_eq!(state.history.worktrees.len(), 1);
+        }
+        let mut frames = TestFrames::new();
+        let origin = sidebar_origin(&mut frames, &mut app);
+        let row = origin + vec2(84.0, 63.0 + 2.0 * HEADER_HEIGHT + REF_HEIGHT / 2.0);
+        open_sidebar_context(&mut frames, &mut app, row);
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| sidebar(cx, &mut app));
+        frames.set_key(Key::Escape, false);
+        frames.draw(|cx| sidebar(cx, &mut app));
+
+        click_sidebar_twice(&mut frames, &mut app, row);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_workdir(), Some(linked.workdir()));
+        let state = app.active().unwrap();
+        assert_eq!(state.history.head_branch.as_deref(), Some("review"));
+        assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+        assert!(app.find_repo_state(repo.workdir()).is_some());
+    }
+
+    #[test]
+    fn gitflow_sidebar_selects_and_checks_out_a_feature_and_offers_new_work() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, repo, mut app, base) = sidebar_repository();
+        let main_name = sidebar_git(repo.workdir(), &["symbolic-ref", "--short", "HEAD"]);
+        for (key, value) in [
+            ("gitflow.branch.master", main_name.as_str()),
+            ("gitflow.branch.develop", "develop"),
+            ("gitflow.prefix.feature", "feature/"),
+        ] {
+            repo.set_local_config(key, Some(value)).unwrap();
+        }
+        repo.create_branch("develop", &base, false).unwrap();
+        repo.create_branch("feature/preview", &base, false).unwrap();
+        let main = repo.commit("Main work", false).unwrap();
+
+        app.settings.hidden_left_sections = ["Remote", "Worktrees", "Tags", "Submodules"]
+            .map(str::to_owned)
+            .into();
+        app.open_repository(&repo.workdir().to_string_lossy());
+        {
+            let state = app.active_mut().unwrap();
+            state.expanded_left_sections.clear();
+            state.expanded_left_sections.insert("Gitflow".to_owned());
+        }
+        let mut frames = TestFrames::new();
+        let origin = sidebar_origin(&mut frames, &mut app);
+        let row = origin + vec2(86.0, 63.0 + 2.0 * HEADER_HEIGHT + REF_HEIGHT / 2.0);
+        frames.click_left(row, |cx| sidebar(cx, &mut app));
+        let state = app.active().unwrap();
+        assert_eq!(
+            state.left_selected.as_deref(),
+            Some("gitflow:refs/heads/feature/preview")
+        );
+        assert_eq!(state.selected, [base.as_str()]);
+        assert_eq!(state.history.head_sha.as_deref(), Some(main.as_str()));
+
+        open_sidebar_context(&mut frames, &mut app, row);
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| sidebar(cx, &mut app));
+        frames.set_key(Key::Escape, false);
+        frames.draw(|cx| sidebar(cx, &mut app));
+        click_sidebar_twice(&mut frames, &mut app, row);
+        assert_eq!(
+            app.active().unwrap().history.head_branch.as_deref(),
+            Some("feature/preview")
+        );
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(base.as_str())
+        );
+
+        let plus = origin + vec2(307.0, 63.0 + HEADER_HEIGHT + HEADER_HEIGHT / 2.0);
+        frames.click_left(plus, |cx| sidebar(cx, &mut app));
+        frames.draw(|cx| {
+            sidebar(cx, &mut app);
+            assert!(crate::ui::menu::menu_open(cx));
+        });
+        choose_sidebar_menu(&mut frames, &mut app, 0);
+        assert!(app.dialog.is(DialogKind::TextPrompt));
+        assert!(app.dialog.message.contains("feature"));
+    }
+
+    fn sidebar_repository() -> (
+        tempfile::TempDir,
+        imgit_git::Repository,
+        Application,
+        String,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Sidebar test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("sidebar@example.invalid"))
+            .unwrap();
+        let base = repo.commit("Base", false).unwrap();
+        let app = Application::with_config_directory(scratch.path().join("config"));
+        (scratch, repo, app, base)
+    }
+
+    fn sidebar_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let result = imgit_git::cli::run(dir, args, imgit_git::cli::RunOptions::default());
+        assert!(result.success(), "git {args:?}: {}", result.text);
+        result.text.trim().to_owned()
+    }
+
+    fn sidebar(cx: &mut Cx<'_>, app: &mut Application) {
+        app.with_active(|app, state| draw_left_panel(cx, app, state, vec2(330.0, 680.0), true))
+            .unwrap();
+        crate::ui::menu::draw_menus(cx, app);
+    }
+
+    fn sidebar_origin(
+        frames: &mut crate::shell::test_frame::TestFrames,
+        app: &mut Application,
+    ) -> Vec2 {
+        let mut origin = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                sidebar(cx, app);
+            });
+        }
+        origin
+    }
+
+    fn open_sidebar_context(
+        frames: &mut crate::shell::test_frame::TestFrames,
+        app: &mut Application,
+        point: Vec2,
+    ) {
+        frames.move_mouse(point.into());
+        frames.draw(|cx| sidebar(cx, app));
+        frames.set_right_mouse(true);
+        frames.draw(|cx| sidebar(cx, app));
+        frames.set_right_mouse(false);
+        frames.draw(|cx| {
+            sidebar(cx, app);
+            assert!(crate::ui::menu::menu_open(cx));
+        });
+    }
+
+    fn choose_sidebar_menu(
+        frames: &mut crate::shell::test_frame::TestFrames,
+        app: &mut Application,
+        position: usize,
+    ) {
+        for _ in 0..=position {
+            frames.set_key(Key::DownArrow, true);
+            frames.draw(|cx| sidebar(cx, app));
+            frames.set_key(Key::DownArrow, false);
+            frames.draw(|cx| sidebar(cx, app));
+        }
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| sidebar(cx, app));
+        frames.set_key(Key::Enter, false);
+        frames.draw(|cx| sidebar(cx, app));
+    }
+
+    fn click_sidebar_twice(
+        frames: &mut crate::shell::test_frame::TestFrames,
+        app: &mut Application,
+        point: Vec2,
+    ) {
+        frames.move_mouse(point.into());
+        frames.draw(|cx| sidebar(cx, app));
+        for _ in 0..2 {
+            frames.set_left_mouse(true);
+            frames.draw(|cx| sidebar(cx, app));
+            frames.set_left_mouse(false);
+            frames.draw(|cx| sidebar(cx, app));
+        }
+    }
+
+    #[test]
     fn versions_parse_like_semver_ranges() {
         let v = parse_version("v1.10.0").unwrap();
         assert_eq!((v.part, v.exact), ([1, 10, 0], true));

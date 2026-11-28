@@ -324,3 +324,184 @@ impl Repository {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repository::tests::ScratchRepository;
+
+    #[test]
+    fn conflicting_history_rewrite_restores_branch_index_and_files() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        let original = scratch.commit_file("tracked.txt", b"original\n", "Original work");
+        repo.create_branch("incoming", &base, true).unwrap();
+        let incoming = scratch.commit_file("tracked.txt", b"incoming\n", "Incoming work");
+        repo.checkout_branch("main").unwrap();
+
+        let error = repo
+            .rewrite_history(
+                &incoming,
+                &[RebaseStep {
+                    sha: original.clone(),
+                    action: RebaseAction::Pick,
+                }],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("Conflicts while applying"));
+        assert!(error.to_string().contains("The branch was restored."));
+        assert_eq!(repo.repo.head().unwrap().name().unwrap(), "refs/heads/main");
+        assert_eq!(
+            repo.head_commit().unwrap().unwrap().id(),
+            parse_oid(&original).unwrap()
+        );
+        assert_eq!(
+            repo.repo.refname_to_id("refs/heads/incoming").unwrap(),
+            parse_oid(&incoming).unwrap(),
+        );
+        assert_eq!(
+            std::fs::read(repo.workdir().join("tracked.txt")).unwrap(),
+            b"original\n"
+        );
+        assert_eq!(repo.repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(repo.incoming_head(), None);
+        assert!(repo.load_status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reverting_creates_a_commit_and_conflicting_reverts_can_be_aborted() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        let changed = scratch.commit_file("tracked.txt", b"change\n", "Edit file");
+        assert_eq!(repo.revert(&changed).unwrap(), Outcome::Done);
+        let revert = repo.head_commit().unwrap().unwrap();
+        assert_eq!(revert.parent_id(0).unwrap(), parse_oid(&changed).unwrap());
+        assert_eq!(
+            revert.tree_id(),
+            repo.lookup_commit(&base).unwrap().tree_id()
+        );
+        assert_eq!(revert.summary().unwrap(), Some("Revert \"Edit file\""));
+        assert!(repo.head_commit_message().unwrap().contains(&changed));
+        assert_eq!(repo.incoming_head(), None);
+
+        repo.reset(&changed, ResetMode::Hard).unwrap();
+        let recent = scratch.commit_file("tracked.txt", b"later\n", "Edit the same line");
+        assert_eq!(repo.revert(&changed).unwrap(), Outcome::Conflicts);
+        assert_eq!(repo.incoming_head().as_deref(), Some(changed.as_str()));
+        let parts = repo.conflict_sides("tracked.txt").unwrap();
+        assert_eq!(parts.base.as_deref(), Some("change\n"));
+        assert_eq!(parts.ours.as_deref(), Some("later\n"));
+        assert_eq!(parts.theirs.as_deref(), Some("base\n"));
+
+        repo.abort_operation().unwrap();
+        assert_eq!(repo.incoming_head(), None);
+        assert_eq!(
+            repo.head_commit().unwrap().unwrap().id(),
+            parse_oid(&recent).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(repo.workdir().join("tracked.txt")).unwrap(),
+            b"later\n"
+        );
+        assert!(repo.load_status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merging_fast_forwards_existing_and_unborn_branches() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        repo.create_branch("topic", &base, true).unwrap();
+        let topic = scratch.commit_file("tracked.txt", b"topic\n", "Topic work");
+        repo.checkout_branch("main").unwrap();
+
+        assert_eq!(repo.merge("topic", false).unwrap(), Outcome::Done);
+        let target = parse_oid(&topic).unwrap();
+        assert_eq!(repo.repo.refname_to_id("refs/heads/main").unwrap(), target);
+        assert_eq!(
+            std::fs::read(repo.workdir().join("tracked.txt")).unwrap(),
+            b"topic\n"
+        );
+
+        repo.repo.set_head("refs/heads/new").unwrap();
+        assert!(repo.head_commit().unwrap().is_none());
+        std::fs::remove_file(repo.workdir().join("tracked.txt")).unwrap();
+        let mut index = repo.repo.index().unwrap();
+        index.clear().unwrap();
+        index.write().unwrap();
+        assert_eq!(repo.merge("topic", false).unwrap(), Outcome::Done);
+        assert_eq!(repo.repo.head().unwrap().name().unwrap(), "refs/heads/new");
+        assert_eq!(repo.repo.refname_to_id("refs/heads/new").unwrap(), target);
+        assert_eq!(
+            std::fs::read(repo.workdir().join("tracked.txt")).unwrap(),
+            b"topic\n"
+        );
+        assert!(repo.load_status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflict_sides_support_missing_entries_and_reject_non_text() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("root.txt", b"base\n", "Base");
+        scratch.commit_file("added.txt", b"main\n", "Add on main");
+        scratch.commit_file("binary.dat", b"\xff\0", "Add binary on main");
+        repo.create_branch("topic", &base, true).unwrap();
+        scratch.commit_file("added.txt", b"topic\n", "Add on topic");
+        let topic = scratch.commit_file("binary.dat", b"\x80\0", "Add binary on topic");
+        repo.checkout_branch("main").unwrap();
+
+        assert_eq!(repo.merge("topic", false).unwrap(), Outcome::Conflicts);
+        assert_eq!(repo.incoming_head(), Some(topic));
+        let parts = repo.conflict_sides("added.txt").unwrap();
+        assert_eq!(parts.base, None);
+        assert_eq!(parts.ours.as_deref(), Some("main\n"));
+        assert_eq!(parts.theirs.as_deref(), Some("topic\n"));
+        let error = repo.conflict_sides("binary.dat").unwrap_err();
+        assert!(error.to_string().contains("external merge tool"));
+        assert!(repo.conflict_sides("root.txt").is_err());
+    }
+
+    #[test]
+    fn aborting_a_cli_rebase_reattaches_head_to_its_original_branch() {
+        if !git_available() {
+            return;
+        }
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        let original = scratch.commit_file("tracked.txt", b"main\n", "Main work");
+        repo.create_branch("topic", &base, true).unwrap();
+        scratch.commit_file("tracked.txt", b"topic\n", "Topic work");
+        repo.checkout_branch("main").unwrap();
+
+        let output = repo.git(
+            ["-c", "rebase.autoStash=false", "rebase", "--merge", "topic"],
+            "",
+        );
+        assert!(!output.success(), "{output:?}");
+        assert!(
+            matches!(
+                repo.repo.state(),
+                git2::RepositoryState::RebaseMerge | git2::RepositoryState::RebaseInteractive
+            ),
+            "{output:?}",
+        );
+        assert!(repo.repo.head_detached().unwrap());
+
+        repo.abort_operation().unwrap();
+        assert_eq!(repo.repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(repo.repo.head().unwrap().name().unwrap(), "refs/heads/main");
+        assert_eq!(
+            repo.head_commit().unwrap().unwrap().id(),
+            parse_oid(&original).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(repo.workdir().join("tracked.txt")).unwrap(),
+            b"main\n"
+        );
+        assert!(repo.load_status().unwrap().is_empty());
+    }
+}

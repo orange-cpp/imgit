@@ -1084,6 +1084,102 @@ mod tests {
     }
 
     #[test]
+    fn cherry_pick_and_revert_menu_actions_change_only_the_selected_commit_and_support_undo() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (scratch, folder) = repository();
+        let base = git_ok(&folder, &["rev-parse", "HEAD"]);
+        git_ok(&folder, &["checkout", "-b", "topic"]);
+        commit_file(&folder, "topic.txt", "feature\n", "topic work");
+        let topic = git_ok(&folder, &["rev-parse", "HEAD"]);
+        git_ok(&folder, &["checkout", "main"]);
+        commit_file(&folder, "main.txt", "main\n", "main work");
+        let main = git_ok(&folder, &["rev-parse", "HEAD"]);
+        git_ok(&folder, &["config", "--local", "user.name", "Test"]);
+        git_ok(
+            &folder,
+            &["config", "--local", "user.email", "test@example.com"],
+        );
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&folder.to_string_lossy());
+
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| cherry_pick_item(&folder, &topic).click.unwrap()(cx, &mut app));
+        assert_eq!(
+            app.active().unwrap().history.head_branch.as_deref(),
+            Some("main")
+        );
+        let picked = git_ok(&folder, &["rev-parse", "HEAD"]);
+        assert_ne!(picked, topic);
+        assert_eq!(git_ok(&folder, &["rev-parse", "HEAD^"]), main);
+        assert_eq!(git_ok(&folder, &["show", "HEAD:topic.txt"]), "feature");
+        assert_eq!(git_ok(&folder, &["show", "HEAD:main.txt"]), "main");
+        assert!(app.toasts.history()[0].title.contains("Cherry picked"));
+
+        frames.draw(|cx| revert_item(&folder, &picked).click.unwrap()(cx, &mut app));
+        assert_eq!(git_ok(&folder, &["rev-parse", "HEAD^"]), picked);
+        assert!(!folder.join("topic.txt").exists());
+        assert!(folder.join("main.txt").exists());
+        assert!(app.toasts.history()[0].title.contains("Reverted"));
+        app.with_active(|app, state| app.undo(state)).unwrap();
+        assert_eq!(git_ok(&folder, &["rev-parse", "HEAD"]), picked);
+        assert!(folder.join("topic.txt").exists());
+        app.with_active(|app, state| app.undo(state)).unwrap();
+        assert_eq!(git_ok(&folder, &["rev-parse", "HEAD"]), main);
+        assert!(!folder.join("topic.txt").exists());
+        assert!(app.active().unwrap().status.is_empty());
+        assert_eq!(git_ok(&folder, &["merge-base", "main", "topic"]), base);
+    }
+
+    #[test]
+    fn checkout_and_compare_menu_items_keep_the_selected_revision_and_workdir() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (scratch, folder) = repository();
+        let base = git_ok(&folder, &["rev-parse", "HEAD"]);
+        commit_file(&folder, "second.txt", "second revision\n", "second");
+        let second = git_ok(&folder, &["rev-parse", "HEAD"]);
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&folder.to_string_lossy());
+        assert!(compare_items(&folder, app.active().unwrap(), &base).is_empty());
+
+        let mut frames = TestFrames::new();
+        let checkout = checkout_commit_item(&folder, &base, true);
+        assert_eq!(checkout.label, "this commit");
+        frames.draw(|cx| checkout.click.unwrap()(cx, &mut app));
+        assert!(app.active().unwrap().history.detached);
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(base.as_str())
+        );
+        assert!(!folder.join("second.txt").exists());
+        app.with_active(|app, state| app.undo(state)).unwrap();
+        assert_eq!(
+            app.active().unwrap().history.head_branch.as_deref(),
+            Some("main")
+        );
+        assert!(folder.join("second.txt").exists());
+
+        std::fs::write(folder.join("a.txt"), "working file\n").unwrap();
+        let state = app.active_mut().unwrap();
+        state.refresh();
+        state.compare_sha = Some(second.clone());
+        let items = compare_items(&folder, state, &base);
+        assert_eq!(items.len(), 1);
+        frames.draw(|cx| items.into_iter().next().unwrap().click.unwrap()(cx, &mut app));
+        let state = app.active().unwrap();
+        assert!(state.is_selected(WIP_SHA));
+        assert!(state.is_selected(&base));
+        assert_eq!(state.selected.len(), 2);
+        assert_eq!(state.compare_sha, None);
+        assert_eq!(state.history.head_sha.as_deref(), Some(second.as_str()));
+        assert_eq!(
+            std::fs::read_to_string(folder.join("a.txt")).unwrap(),
+            "working file\n"
+        );
+    }
+
+    #[test]
     fn a_cherry_pick_that_stops_midway_can_still_be_undone() {
         let (scratch, dir) = repository();
         git_ok(&dir, &["checkout", "-b", "side"]);

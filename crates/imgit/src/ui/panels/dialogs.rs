@@ -1137,7 +1137,14 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let mut full = vec!["-c", "user.name=Test", "-c", "user.email=test@example.com"];
+        let mut full = vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgSign=false",
+        ];
         full.extend(args);
         let output = imgit_git::cli::run(dir, full, imgit_git::cli::RunOptions::default());
         assert_eq!(output.exit_code, 0, "git {args:?}: {}", output.text);
@@ -1173,6 +1180,402 @@ mod tests {
         let mut app = Application::with_config_directory(scratch.path().join("config"));
         app.open_repository(&folder.to_string_lossy());
         (scratch, app, folder)
+    }
+
+    fn submit_name(frames: &mut crate::shell::test_frame::TestFrames, app: &mut Application) {
+        for _ in 0..3 {
+            frames.draw(|cx| draw_dialogs(cx, app));
+        }
+        frames.set_key(dear_imgui_rs::Key::Enter, true);
+        frames.draw(|cx| draw_dialogs(cx, app));
+        frames.set_key(dear_imgui_rs::Key::Enter, false);
+        frames.draw(|cx| draw_dialogs(cx, app));
+        assert!(!app.dialog.is_open());
+    }
+
+    #[test]
+    fn the_create_file_prompt_creates_a_nested_file_and_opens_its_editor() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app, folder) = fixture();
+        let mut frames = TestFrames::new();
+        app.dialog.open(DialogKind::CreateFile);
+        app.dialog.text_b = "docs".to_owned();
+        app.dialog.text_a = "notes/summary.txt".to_owned();
+        submit_name(&mut frames, &mut app);
+
+        let created = folder.join("docs").join("notes").join("summary.txt");
+        assert!(created.is_file());
+        assert_eq!(std::fs::read(&created).unwrap(), b"");
+        let state = app.active().unwrap();
+        let edit = state.file_edit.as_ref().unwrap();
+        assert_eq!(edit.path, "docs/notes/summary.txt");
+        assert!(edit.text.is_empty());
+        assert_eq!(state.diff_target.as_ref().unwrap().path, edit.path);
+
+        std::fs::write(&created, "Keep this text").unwrap();
+        app.dialog.open(DialogKind::CreateFile);
+        app.dialog.text_a = "docs/notes/summary.txt".to_owned();
+        submit_name(&mut frames, &mut app);
+        assert_eq!(std::fs::read_to_string(&created).unwrap(), "Keep this text");
+        assert_eq!(
+            app.toasts.history()[0].detail,
+            "A file with that name exists."
+        );
+    }
+
+    #[test]
+    fn renaming_from_the_branch_prompt_keeps_the_upstream_through_undo_and_redo() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app, _) = fixture();
+        let tip = app
+            .active()
+            .unwrap()
+            .find_ref("refs/heads/topic")
+            .unwrap()
+            .target
+            .clone();
+        app.dialog.open(DialogKind::RenameBranch);
+        app.dialog.ref_name = "topic".to_owned();
+        app.dialog.text_a = "renamed".to_owned();
+        let mut frames = TestFrames::new();
+        submit_name(&mut frames, &mut app);
+        app.with_active(|app, state| {
+            let check = |state: &RepoState, name: &str| {
+                let branch = state.find_ref(&format!("refs/heads/{name}")).unwrap();
+                assert_eq!(branch.target, tip);
+                assert_eq!(branch.upstream.as_deref(), Some("origin/topic"));
+            };
+            assert!(state.find_ref("refs/heads/topic").is_none());
+            check(state, "renamed");
+            app.undo(state);
+            assert!(state.find_ref("refs/heads/renamed").is_none());
+            check(state, "topic");
+            app.redo(state);
+            assert!(state.find_ref("refs/heads/topic").is_none());
+            check(state, "renamed");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn editing_the_stash_message_leaves_the_stash_available_to_apply() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app, folder) = fixture();
+        let file = folder.join("one.txt");
+        std::fs::write(&file, "Changed in stash").unwrap();
+        let sha = app
+            .with_active(|_, state| {
+                let sha = state.repo.stash_push("Original message").unwrap();
+                state.refresh();
+                sha
+            })
+            .unwrap();
+        app.dialog.open(DialogKind::EditStashMessage);
+        app.dialog.sha = sha;
+        app.dialog.text_a = "New description".to_owned();
+        let mut frames = TestFrames::new();
+        submit_name(&mut frames, &mut app);
+        let state = app.active().unwrap();
+        let stash = state
+            .history
+            .refs
+            .iter()
+            .find(|reference| reference.ref_type == imgit_git::RefType::Stash)
+            .unwrap();
+        assert_eq!(
+            imgit_git::repository::stash_summary(&stash.message),
+            "New description"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one");
+        state.repo.stash_apply(stash.stash_index.unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "Changed in stash");
+    }
+
+    #[test]
+    fn hard_reset_from_the_dialog_stashes_changes_and_undo_restores_them() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app, folder) = fixture();
+        let before = git(&folder, &["rev-parse", "HEAD~1"]);
+        let head = git(&folder, &["rev-parse", "HEAD"]);
+        let file = folder.join("one.txt");
+        std::fs::write(&file, "staged edit").unwrap();
+        git(&folder, &["add", "--", "one.txt"]);
+        app.active_mut().unwrap().refresh();
+        app.dialog.open(DialogKind::Reset);
+        app.dialog.sha.clone_from(&before);
+        app.dialog.reset_mode = ResetMode::Hard;
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+
+        assert!(!app.dialog.is_open());
+        assert_eq!(git(&folder, &["rev-parse", "HEAD"]), before);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one");
+        assert!(!folder.join("two.txt").exists());
+        assert!(
+            app.toasts.history()[0]
+                .title
+                .contains(AUTO_STASH_BEFORE_RESET)
+        );
+        assert!(git(&folder, &["stash", "list"]).contains(AUTO_STASH_BEFORE_RESET));
+
+        app.with_active(|app, state| app.undo(state)).unwrap();
+        assert_eq!(git(&folder, &["rev-parse", "HEAD"]), head);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "staged edit");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("two.txt")).unwrap(),
+            "two"
+        );
+        assert_eq!(git(&folder, &["show", ":one.txt"]), "staged edit");
+        assert!(git(&folder, &["stash", "list"]).is_empty());
+
+        app.with_active(|app, state| app.redo(state)).unwrap();
+        assert_eq!(git(&folder, &["rev-parse", "HEAD"]), before);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one");
+        assert!(git(&folder, &["stash", "list"]).contains(AUTO_STASH_BEFORE_RESET));
+    }
+
+    #[test]
+    fn soft_and_mixed_reset_dialogs_preserve_files_and_restore_the_tip_on_undo() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app, folder) = fixture();
+        let before = git(&folder, &["rev-parse", "HEAD~1"]);
+        let head = git(&folder, &["rev-parse", "HEAD"]);
+        let mut frames = TestFrames::new();
+        for (mode, status) in [
+            (ResetMode::Soft, "A  two.txt"),
+            (ResetMode::Mixed, "?? two.txt"),
+        ] {
+            app.dialog.open(DialogKind::Reset);
+            app.dialog.sha.clone_from(&before);
+            app.dialog.reset_mode = mode;
+            frames.draw(|cx| draw_dialogs(cx, &mut app));
+
+            assert_eq!(git(&folder, &["rev-parse", "HEAD"]), before);
+            assert_eq!(git(&folder, &["status", "--porcelain"]), status);
+            assert_eq!(
+                std::fs::read_to_string(folder.join("two.txt")).unwrap(),
+                "two"
+            );
+            assert!(git(&folder, &["stash", "list"]).is_empty());
+            app.with_active(|app, state| app.undo(state)).unwrap();
+            assert_eq!(git(&folder, &["rev-parse", "HEAD"]), head);
+            assert!(git(&folder, &["status", "--porcelain"]).is_empty());
+
+            app.with_active(|app, state| app.redo(state)).unwrap();
+            assert_eq!(git(&folder, &["rev-parse", "HEAD"]), before);
+            assert_eq!(git(&folder, &["status", "--porcelain"]), status);
+            app.with_active(|app, state| app.undo(state)).unwrap();
+        }
+    }
+
+    #[test]
+    fn deleting_a_stash_from_the_prompt_uses_its_sha_after_the_list_changes() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app, folder) = fixture();
+        let file = folder.join("one.txt");
+        std::fs::write(&file, "older").unwrap();
+        let older = app.active().unwrap().repo.stash_push("Older").unwrap();
+        app.dialog = delete_request(DialogKind::DeleteStash, "stash@{0}", &older);
+        app.dialog.stash_index = Some(0);
+        app.dialog.text_b = "Older".to_owned();
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+
+        std::fs::write(&file, "newer").unwrap();
+        let newer = app.active().unwrap().repo.stash_push("Newer").unwrap();
+        assert_eq!(app.active().unwrap().repo.stash_index_of(&older), Some(1));
+        click_dialog_confirmation(&mut frames, &mut app);
+        assert!(!app.dialog.is_open());
+        assert_eq!(app.active().unwrap().repo.stash_index_of(&older), None);
+        assert_eq!(app.active().unwrap().repo.stash_index_of(&newer), Some(0));
+        assert_eq!(app.toasts.history()[0].title, "Stash deleted");
+
+        app.dialog = delete_request(DialogKind::DeleteStash, "stash@{0}", &older);
+        click_dialog_confirmation(&mut frames, &mut app);
+        assert!(!app.dialog.is_open());
+        assert_eq!(app.toasts.history()[0].detail, "The stash is gone.");
+        assert_eq!(app.active().unwrap().repo.stash_index_of(&newer), Some(0));
+    }
+
+    #[test]
+    fn discard_all_requires_confirmation_and_preserves_changes_when_cancelled() {
+        use crate::shell::test_frame::TestFrames;
+        use dear_imgui_rs::Key;
+
+        let (_scratch, mut app, folder) = fixture();
+        std::fs::write(folder.join("one.txt"), "staged edit").unwrap();
+        git(&folder, &["add", "--", "one.txt"]);
+        std::fs::write(folder.join("two.txt"), "unstaged edit").unwrap();
+        std::fs::write(folder.join("untracked.txt"), "untracked file").unwrap();
+        let status = git(&folder, &["status", "--porcelain"]);
+        let mut frames = TestFrames::new();
+        app.dialog.open(DialogKind::DiscardAll);
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+        assert!(
+            app.dialog.is_open(),
+            "the key that opened the prompt is ignored"
+        );
+        frames.set_key(Key::Escape, false);
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+        assert!(!app.dialog.is_open());
+        assert_eq!(git(&folder, &["status", "--porcelain"]), status);
+
+        frames.set_key(Key::Escape, false);
+        app.dialog.open(DialogKind::DiscardAll);
+        click_dialog_confirmation(&mut frames, &mut app);
+        assert!(!app.dialog.is_open());
+        assert!(git(&folder, &["status", "--porcelain"]).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("one.txt")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join("two.txt")).unwrap(),
+            "two"
+        );
+        assert!(!folder.join("untracked.txt").exists());
+        assert_eq!(app.toasts.history()[0].title, "Changes discarded");
+    }
+
+    #[test]
+    fn confirming_the_push_prompt_creates_the_named_upstream_on_its_original_tab() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (scratch, mut app, folder) = fixture();
+        let remote = scratch.path().join("backup.git");
+        git(
+            scratch.path(),
+            &["init", "--bare", &remote.to_string_lossy()],
+        );
+        git(
+            &folder,
+            &["remote", "add", "backup", &remote.to_string_lossy()],
+        );
+        app.active_mut().unwrap().refresh();
+        let other = imgit_git::Repository::init(scratch.path().join("other")).unwrap();
+        let head = git(&folder, &["rev-parse", "HEAD"]);
+        app.dialog.open(DialogKind::PushNewBranch);
+        app.dialog.ref_name = "main".to_owned();
+        app.dialog.text_a = "backup".to_owned();
+        app.dialog.text_b = "review/main".to_owned();
+
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+        app.open_repository(&other.workdir().to_string_lossy());
+        submit_name(&mut frames, &mut app);
+        assert_eq!(app.active_workdir(), Some(other.workdir()));
+        assert!(!app.active().unwrap().busy());
+        let original = app.tabs[0].state.as_deref().unwrap();
+        assert_eq!(
+            original.async_op.as_ref().unwrap().args,
+            ["push", "--set-upstream", "--", "backup", "main:review/main"],
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].state.as_deref().unwrap().busy() {
+            assert!(std::time::Instant::now() < deadline, "push timed out");
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(git(&remote, &["rev-parse", "refs/heads/review/main"]), head);
+        assert_eq!(
+            git(&folder, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+            "backup/review/main"
+        );
+        assert_ne!(app.toasts.history()[0].kind, ToastKind::Error);
+    }
+
+    #[test]
+    fn credential_prompt_delivers_the_entered_credential_once_and_cancel_never_retries() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::shell::test_frame::TestFrames;
+        use dear_imgui_rs::Key;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let accepted = Rc::new(RefCell::new(Vec::new()));
+        let received = Rc::clone(&accepted);
+        let attempt = Credential {
+            url: "https://git.example.invalid".to_owned(),
+            username: "test-user".to_owned(),
+            remember: true,
+            ..Credential::default()
+        };
+        let request = "fatal: could not read Username for 'https://git.example.invalid': terminal prompts disabled";
+        assert!(app.prompt_for_credentials(
+            request,
+            Some(&attempt),
+            Box::new(move |_, cred| {
+                received.borrow_mut().push(cred);
+            })
+        ));
+        let mut frames = TestFrames::new();
+        for _ in 0..3 {
+            frames.draw(|cx| draw_dialogs(cx, &mut app));
+        }
+        assert!(accepted.borrow().is_empty());
+        frames.type_text("synthetic-token");
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+        frames.set_key(Key::Enter, false);
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+        assert!(app.credential_prompt.is_none());
+        assert_eq!(
+            *accepted.borrow(),
+            [Credential {
+                password: "synthetic-token".to_owned(),
+                ..attempt
+            }]
+        );
+
+        assert!(app.prompt_for_credentials(
+            request,
+            None,
+            Box::new(|_, _| panic!("cancel retried"))
+        ));
+        for _ in 0..2 {
+            frames.draw(|cx| draw_dialogs(cx, &mut app));
+        }
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| draw_dialogs(cx, &mut app));
+        assert!(app.credential_prompt.is_none());
+        assert!(app.credentials.is_empty());
+    }
+
+    fn click_dialog_confirmation(
+        frames: &mut crate::shell::test_frame::TestFrames,
+        app: &mut Application,
+    ) {
+        let (message, label, _) = confirm_texts(&app.dialog);
+        let mut button = crate::ui::Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let (work, _) = crate::ui::raw::work_area(cx.ui);
+                let (_, size) = crate::ui::raw::viewport(cx.ui);
+                let message_w = cx.text_size(cx.fonts.regular, 14.0, &message).x;
+                let width = |label| cx.text_size(cx.fonts.bold, 12.0, label).x + cx.px(12.0);
+                let confirm_w = width(label.as_str());
+                let total = message_w + cx.px(42.0) + confirm_w + width("Cancel");
+                let x = (work.x + cx.px(10.0).max((size.x - total) / 2.0)).round();
+                button = crate::ui::vec2(
+                    x + message_w + cx.px(22.0) + confirm_w / 2.0,
+                    work.y + cx.px(crate::theme::TABS_BAR_HEIGHT + 24.0),
+                );
+                draw_dialogs(cx, app);
+            });
+        }
+        frames.click_left(button, |cx| draw_dialogs(cx, app));
     }
 
     fn delete_request(kind: DialogKind, name: &str, sha: &str) -> Dialog {

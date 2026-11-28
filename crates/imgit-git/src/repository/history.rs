@@ -618,3 +618,194 @@ fn renamed_from(
 fn to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repository::tests::ScratchRepository;
+
+    #[test]
+    fn smart_history_walks_the_current_branch_upstream_and_remote_default() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("root.txt", b"base\n", "Base");
+        repo.create_branch("topic", &base, true).unwrap();
+        let upstream = scratch.commit_file("topic.txt", b"shared\n", "Shared topic work");
+        let topic = scratch.commit_file("topic.txt", b"local\n", "Local topic work");
+        repo.create_branch("trunk", &base, true).unwrap();
+        let trunk = scratch.commit_file("trunk.txt", b"default\n", "Default branch work");
+        repo.create_branch("side", &base, true).unwrap();
+        let side = scratch.commit_file("side.txt", b"side\n", "Unrelated work");
+        repo.checkout_branch("topic").unwrap();
+
+        repo.add_remote("mirror", ".").unwrap();
+        scratch.remote_tip("mirror/topic", &upstream);
+        scratch.remote_tip("mirror/trunk", &trunk);
+        scratch.remote_tip("mirror/side", &side);
+        repo.repo
+            .reference_symbolic(
+                "refs/remotes/mirror/HEAD",
+                "refs/remotes/mirror/trunk",
+                false,
+                "test: set remote default",
+            )
+            .unwrap();
+        repo.set_upstream("topic", Some("mirror/topic")).unwrap();
+
+        let history = repo
+            .load_history(&HistoryOptions {
+                smart_visibility: true,
+                ..HistoryOptions::default()
+            })
+            .unwrap();
+        let shown: HashSet<_> = history
+            .refs
+            .iter()
+            .filter(|reference| !reference.hidden)
+            .map(|reference| reference.full_name.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            HashSet::from([
+                "refs/heads/topic",
+                "refs/heads/trunk",
+                "refs/remotes/mirror/topic",
+                "refs/remotes/mirror/trunk",
+            ])
+        );
+        assert_eq!(history.head_branch.as_deref(), Some("topic"));
+        for sha in [&base, &upstream, &topic, &trunk] {
+            assert!(history.commit(sha).is_some(), "missing commit {sha}");
+        }
+        assert!(history.commit(&side).is_none());
+
+        repo.repo
+            .find_reference("refs/remotes/mirror/HEAD")
+            .unwrap()
+            .delete()
+            .unwrap();
+        let history = repo
+            .load_history(&HistoryOptions {
+                smart_visibility: true,
+                ..HistoryOptions::default()
+            })
+            .unwrap();
+        assert!(
+            history
+                .refs
+                .iter()
+                .any(|reference| reference.name == "main" && !reference.hidden)
+        );
+        assert!(history.commit(&trunk).is_none());
+    }
+
+    #[test]
+    fn fallback_history_inserts_stashes_only_at_loaded_bases() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        scratch.write("tracked.txt", b"stashed\n");
+        let stash_sha = repo.stash_push("Saved work").unwrap();
+        let tip = scratch.commit_file("tracked.txt", b"tip\n", "Tip");
+        let stashes = [
+            Ref {
+                ref_type: RefType::Stash,
+                target: stash_sha.clone(),
+                message: "On main: Saved work".to_owned(),
+                ..Ref::default()
+            },
+            Ref {
+                target: "missing stash commit".to_owned(),
+                ..Ref::default()
+            },
+            Ref {
+                target: base.clone(),
+                ..Ref::default()
+            },
+        ];
+        let tips = [parse_oid(&tip).unwrap()];
+
+        let mut capped = History::default();
+        repo.walk_history(&mut capped, &tips, &stashes, 1).unwrap();
+        assert!(capped.has_more);
+        assert_eq!(capped.commits.len(), 1);
+        assert_eq!(capped.commits[0].sha, tip);
+        assert!(capped.refs.is_empty());
+
+        let mut full = History::default();
+        repo.walk_history(&mut full, &tips, &stashes, 2).unwrap();
+        assert!(!full.has_more);
+        assert_eq!(
+            full.commits
+                .iter()
+                .map(|commit| commit.sha.as_str())
+                .collect::<Vec<_>>(),
+            vec![tip.as_str(), stash_sha.as_str(), base.as_str()],
+        );
+        let stash = &full.commits[1];
+        assert_eq!(stash.node_type, NodeType::Stash);
+        assert_eq!(stash.summary, "Saved work");
+        assert_eq!(stash.parents, [base]);
+        assert_eq!(full.refs.len(), 1);
+        assert_eq!(full.refs[0].target, stash_sha);
+    }
+
+    #[test]
+    fn file_history_follows_renames_and_deletions() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        assert!(
+            repo.file_history("after.txt", None, 20)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let original = scratch.commit_file("before.txt", b"original\n", "Add file");
+        std::fs::rename(
+            repo.workdir().join("before.txt"),
+            repo.workdir().join("after.txt"),
+        )
+        .unwrap();
+        repo.stage_all().unwrap();
+        let rename = repo.commit("Rename file", false).unwrap();
+        let edit = scratch.commit_file("after.txt", b"updated\n", "Edit file");
+        scratch.commit_file("unrelated.txt", b"unrelated\n", "Unrelated work");
+        std::fs::remove_file(repo.workdir().join("after.txt")).unwrap();
+        repo.stage_all().unwrap();
+        let deletion = repo.commit("Delete file", false).unwrap();
+
+        let history = repo.file_history("after.txt", None, 20).unwrap();
+        assert!(!history.has_more);
+        let changes: Vec<_> = history
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.commit.sha.as_str(),
+                    entry.status,
+                    entry.path.as_str(),
+                    entry.old_path.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                (deletion.as_str(), FileStatus::Deleted, "after.txt", None),
+                (edit.as_str(), FileStatus::Modified, "after.txt", None),
+                (
+                    rename.as_str(),
+                    FileStatus::Renamed,
+                    "after.txt",
+                    Some("before.txt")
+                ),
+                (original.as_str(), FileStatus::Added, "before.txt", None),
+            ]
+        );
+
+        let limited = repo.file_history("after.txt", Some(&edit), 1).unwrap();
+        assert!(limited.has_more);
+        assert_eq!(limited.entries.len(), 1);
+        assert_eq!(limited.entries[0].commit.sha, edit);
+    }
+}

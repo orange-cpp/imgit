@@ -840,6 +840,123 @@ fn commit(_cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    fn working_copy() -> (tempfile::TempDir, Application, String) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Composer test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("composer@example.invalid"))
+            .unwrap();
+        repo.set_local_config("commit.gpgsign", Some("false"))
+            .unwrap();
+        repo.set_local_config("imgit.skipHooks", Some("true"))
+            .unwrap();
+        let template = scratch.path().join("template.txt");
+        std::fs::write(&template, "Template summary\n\nTemplate body").unwrap();
+        repo.set_local_config("commit.template", Some(&template.to_string_lossy()))
+            .unwrap();
+        let path = repo.workdir().join("file.txt");
+        std::fs::write(&path, "Before\n").unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let base = repo.commit("Base", false).unwrap();
+        std::fs::write(path, "After\n").unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, app, base)
+    }
+
+    #[test]
+    fn stage_all_and_commit_use_the_template_and_soft_undo_keeps_the_index() {
+        let (_scratch, mut app, base) = working_copy();
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.select_only(imgit_app::WIP_SHA);
+            state.push_after_commit = false;
+            let size = vec2(440.0, 660.0);
+            let draw = |cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState| {
+                super::super::draw_detail_panel(cx, app, state, size);
+            };
+            let mut stage_all = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    // Right end of Stage All Changes in the first file section.
+                    stage_all = cx.cursor() + vec2(size.x - 35.0, 71.0 + 23.0);
+                    draw(cx, app, state);
+                });
+            }
+            assert_eq!(state.commit_summary, "Template summary");
+            assert_eq!(state.commit_description, "Template body");
+            assert_eq!(state.status.unstaged.len(), 1);
+            assert!(state.status.staged.is_empty());
+            frames.click_left(stage_all, |cx| draw(cx, app, state));
+            assert!(state.status.unstaged.is_empty());
+            assert_eq!(state.status.staged[0].path, "file.txt");
+
+            frames.set_key(Key::ModCtrl, true);
+            frames.set_key(Key::Enter, true);
+            frames.draw(|cx| draw(cx, app, state));
+            assert_ne!(state.history.head_sha.as_deref(), Some(base.as_str()));
+            let message = state.repo.head_commit_message().unwrap();
+            assert_eq!(message.trim_end(), "Template summary\n\nTemplate body");
+            assert!(state.status.is_empty());
+
+            app.undo(state);
+            assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+            assert_eq!(state.status.staged[0].path, "file.txt");
+            assert!(state.status.unstaged.is_empty());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn stash_composer_saves_its_message_and_undo_restores_unstaged_changes() {
+        let (_scratch, mut app, base) = working_copy();
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.select_only(imgit_app::WIP_SHA);
+            let size = vec2(440.0, 660.0);
+            let draw = |cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState| {
+                super::super::draw_detail_panel(cx, app, state, size);
+            };
+            let mut stash_tab = Vec2::ZERO;
+            let mut stash_button = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    let composer = size.y - 310.0;
+                    let commit_tab_width = cx.px(33.5)
+                        + cx.text_size(cx.fonts.regular, 14.0, "Commit").x
+                        + cx.px(13.0);
+                    stash_tab = cx.cursor() + vec2(10.0 + commit_tab_width + 22.0, composer + 25.0);
+                    stash_button = cx.cursor() + vec2(size.x / 2.0, composer + 280.0);
+                    draw(cx, app, state);
+                });
+            }
+            frames.click_left(stash_tab, |cx| draw(cx, app, state));
+            assert!(state.composer_stash);
+            state.stash_summary = "Keep for later".to_owned();
+            state.stash_description = "Work in progress".to_owned();
+            frames.click_left(stash_button, |cx| draw(cx, app, state));
+            assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+            assert!(state.status.is_empty());
+            assert!(state.stash_summary.is_empty() && state.stash_description.is_empty());
+            let saved = state
+                .history
+                .refs
+                .iter()
+                .find(|reference| reference.ref_type == imgit_git::RefType::Stash)
+                .unwrap();
+            assert!(saved.message.contains("Keep for later"));
+            assert!(saved.message.contains("Work in progress"));
+
+            app.undo(state);
+            assert_eq!(state.status.unstaged[0].path, "file.txt");
+            assert!(state.status.staged.is_empty());
+        })
+        .unwrap();
+    }
 
     #[test]
     fn the_commit_chord_stays_out_of_the_terminal_and_dialogs() {

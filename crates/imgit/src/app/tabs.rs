@@ -1308,6 +1308,268 @@ mod tests {
     }
 
     #[test]
+    fn nested_submodules_use_one_tab_and_keep_the_parent_states_addressable() {
+        let scratch = tempfile::tempdir().unwrap();
+        let leaf = committed_repo(&scratch, "leaf");
+        let middle = committed_repo(&scratch, "middle");
+        let parent = committed_repo(&scratch, "superproject");
+        let other = committed_repo(&scratch, "other");
+        add_test_submodule(&middle, &leaf, "nested");
+        add_test_submodule(&parent, &middle, "component");
+        run_fixture_git(
+            parent.workdir(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+        );
+        let parent_dir = parent.workdir().to_owned();
+        let middle_dir = Repository::open(parent_dir.join("component"))
+            .unwrap()
+            .workdir()
+            .to_owned();
+        let leaf_dir = Repository::open(middle_dir.join("nested"))
+            .unwrap()
+            .workdir()
+            .to_owned();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&other.workdir().to_string_lossy());
+        app.open_repository(&parent_dir.to_string_lossy());
+        let tab_id = app.tabs[1].id;
+        app.with_active(|app, state| {
+            app.open_submodule(state, "not-initialized");
+            assert_eq!(
+                app.toasts.history()[0].detail,
+                "'not-initialized' is not initialized."
+            );
+            app.close_submodule(state);
+            app.open_submodule(state, "component");
+            assert_eq!(app.active_workdir(), Some(parent_dir.as_path()));
+        })
+        .unwrap();
+        assert_eq!(app.tabs[1].id, tab_id);
+        assert_eq!(app.tabs[1].root_workdir, parent_dir);
+        assert_eq!(app.active_workdir(), Some(middle_dir.as_path()));
+        assert!(app.tabs[1].submodule);
+
+        app.with_active(|app, state| app.open_submodule(state, "nested"))
+            .unwrap();
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_workdir(), Some(leaf_dir.as_path()));
+        assert_eq!(
+            app.repo_workdirs(),
+            [
+                other.workdir(),
+                leaf_dir.as_path(),
+                middle_dir.as_path(),
+                parent_dir.as_path()
+            ]
+        );
+        assert_eq!(
+            app.find_repo_state(&parent_dir).unwrap().repo.workdir(),
+            parent_dir
+        );
+        assert_eq!(app.tab_index_of(&parent_dir), None);
+
+        let mut visited = Vec::new();
+        app.for_each_repo_state_mut(|state| visited.push(state.repo.workdir().to_owned()));
+        assert_eq!(visited, app.repo_workdirs());
+        app.with_repo(&parent_dir, |app, state| {
+            assert!(app.find_repo_state(&parent_dir).is_none());
+            assert_eq!(state.repo.workdir(), parent_dir);
+            state.commit_limit = 17;
+            app.move_tab(1, 0);
+        })
+        .unwrap();
+        assert_eq!(app.tabs[0].id, tab_id);
+        assert_eq!(app.find_repo_state(&parent_dir).unwrap().commit_limit, 17);
+        app.with_repo(&middle_dir, |app, state| {
+            assert!(app.find_repo_state(&parent_dir).is_none());
+            assert_eq!(state.root().repo.workdir(), parent_dir);
+        })
+        .unwrap();
+
+        app.open_repository(&parent_dir.to_string_lossy());
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_workdir(), Some(leaf_dir.as_path()));
+        app.dialog.open(DialogKind::Confirm);
+        app.dialog.workdir = Some(leaf_dir.clone());
+        app.with_active(|app, state| {
+            app.run_git_cli(state, "Read worktree status", ["status", "--short"]);
+            assert!(state.busy());
+            app.close_submodule(state);
+        })
+        .unwrap();
+        assert_eq!(app.active_workdir(), Some(leaf_dir.as_path()));
+        assert!(app.dialog.is_open());
+        finish_tab_git_operation(&mut app, "Read worktree status");
+        app.with_active(|app, state| app.close_submodule(state))
+            .unwrap();
+        assert!(!app.dialog.is_open());
+        assert_eq!(app.active_workdir(), Some(middle_dir.as_path()));
+        app.with_active(|app, state| app.close_submodule(state))
+            .unwrap();
+        assert_eq!(app.active_workdir(), Some(parent_dir.as_path()));
+        assert!(!app.tabs[0].submodule);
+        assert_eq!(app.closed_submodules.len(), 2);
+        assert!(app.find_repo_state(&leaf_dir).is_none());
+        assert!(app.find_repo_state(&middle_dir).is_none());
+    }
+
+    #[test]
+    fn opening_linked_worktrees_groups_them_with_the_main_checkout() {
+        let scratch = tempfile::tempdir().unwrap();
+        let main = committed_repo(&scratch, "project");
+        let unrelated = committed_repo(&scratch, "unrelated");
+        let first = scratch.path().join("first-worktree");
+        let second = scratch.path().join("second-worktree");
+        for (branch, path) in [("first", &first), ("second", &second)] {
+            run_fixture_git(
+                main.workdir(),
+                &["worktree", "add", "-b", branch, &path.to_string_lossy()],
+            );
+        }
+
+        let config = scratch.path().join("config");
+        let mut app = Application::with_config_directory(config.clone());
+        for path in [main.workdir(), unrelated.workdir(), first.as_path()] {
+            app.open_repository(&path.to_string_lossy());
+        }
+        assert_eq!(labels(&app), ["project", "first-worktree", "unrelated"]);
+        assert_eq!(groups(&app), [Some("project"), Some("project"), None]);
+        assert_eq!(app.tab_label(app.active_tab.unwrap()), "first-worktree");
+        assert_eq!(app.tabs[0].root_common_dir, app.tabs[1].root_common_dir);
+
+        app.rename_tab_group("project", "Team");
+        app.open_repository(&second.to_string_lossy());
+        assert_eq!(
+            labels(&app),
+            ["project", "first-worktree", "second-worktree", "unrelated"]
+        );
+        assert_eq!(
+            groups(&app),
+            [Some("Team"), Some("Team"), Some("Team"), None]
+        );
+        assert_eq!(app.tab_label(app.active_tab.unwrap()), "second-worktree");
+
+        app.save_state();
+        let mut reopened = Application::with_config_directory(config);
+        reopened.restore_tabs();
+        assert_eq!(
+            groups(&reopened),
+            [Some("Team"), Some("Team"), Some("Team"), None]
+        );
+        assert_eq!(
+            reopened.tab_label(reopened.active_tab.unwrap()),
+            "second-worktree"
+        );
+        assert_eq!(reopened.tab_groups.len(), 1);
+    }
+
+    #[test]
+    fn confirming_recursive_initialization_uses_the_original_tab() {
+        use crate::shell::test_frame::TestFrames;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let child = committed_repo(&scratch, "child");
+        let parent = committed_repo(&scratch, "superproject");
+        add_test_submodule(&parent, &child, "component");
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.offer_recursive_submodule_init();
+        assert!(!app.dialog.is_open());
+        app.open_repository(&child.workdir().to_string_lossy());
+        app.offer_recursive_submodule_init();
+        assert!(!app.dialog.is_open());
+
+        app.open_repository(&parent.workdir().to_string_lossy());
+        app.offer_recursive_submodule_init();
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert!(!app.dialog.danger);
+        assert_eq!(app.dialog.workdir.as_deref(), Some(parent.workdir()));
+        assert_eq!(app.dialog.confirm_label, "Initialize");
+
+        let confirm = app.dialog.on_confirm.take().unwrap();
+        app.dialog.close();
+        app.active_tab = Some(0);
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| confirm(cx, &mut app));
+        assert!(!app.active().unwrap().busy());
+        assert!(app.find_repo_state(parent.workdir()).unwrap().busy());
+        assert_eq!(app.active_workdir(), Some(child.workdir()));
+        app.active_tab = Some(1);
+        finish_tab_git_operation(&mut app, "Initialize submodules");
+        assert!(
+            app.active()
+                .unwrap()
+                .history
+                .submodules
+                .iter()
+                .any(|module| module.path == "component")
+        );
+    }
+
+    fn committed_repo(scratch: &tempfile::TempDir, name: &str) -> Repository {
+        let repo = Repository::init(scratch.path().join(name)).unwrap();
+        repo.set_local_config("user.name", Some("Submodule tests"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("submodule@example.invalid"))
+            .unwrap();
+        fs::write(repo.workdir().join("tracked.txt"), format!("{name}\n")).unwrap();
+        repo.stage(&["tracked.txt"]).unwrap();
+        repo.commit("Initial commit", false).unwrap();
+        repo
+    }
+
+    fn add_test_submodule(parent: &Repository, child: &Repository, path: &str) {
+        run_fixture_git(
+            parent.workdir(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--",
+                &child.workdir().to_string_lossy(),
+                path,
+            ],
+        );
+        Repository::open(parent.workdir())
+            .unwrap()
+            .commit("Add submodule", false)
+            .unwrap();
+    }
+
+    fn run_fixture_git(workdir: &Path, args: &[&str]) {
+        let output = imgit_git::cli::run(workdir, args, imgit_git::cli::RunOptions::default());
+        assert!(output.success(), "git {args:?}: {}", output.text);
+    }
+
+    fn finish_tab_git_operation(app: &mut Application, title: &str) {
+        use std::time::{Duration, Instant};
+
+        let operation = app.active().unwrap().async_op.as_ref().unwrap();
+        assert_eq!(operation.title, title);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(Instant::now() < deadline, "{title} timed out");
+            app.poll_async();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_ne!(
+            app.toasts.history()[0].kind,
+            ToastKind::Error,
+            "{:?}",
+            app.toasts.history()[0]
+        );
+    }
+
+    #[test]
     fn adjacent_tabs_wrap_round() {
         let mut f = fixture(&["a", "b", "c"]);
         f.app.active_tab = Some(2);

@@ -576,6 +576,53 @@ fn sha_of(id: git2::Oid) -> Sha {
 mod tests {
     use super::*;
 
+    pub(super) struct ScratchRepository {
+        pub repo: Repository,
+        _scratch: tempfile::TempDir,
+    }
+
+    impl ScratchRepository {
+        pub fn new() -> Self {
+            let scratch = tempfile::tempdir().unwrap();
+            let repo = Repository::init(scratch.path()).unwrap();
+            repo.repo.set_head("refs/heads/main").unwrap();
+            for (key, value) in [
+                ("user.name", "ImGit test"),
+                ("user.email", "imgit@example.invalid"),
+                ("core.autocrlf", "false"),
+                ("commit.gpgSign", "false"),
+            ] {
+                repo.set_local_config(key, Some(value)).unwrap();
+            }
+            Self {
+                repo,
+                _scratch: scratch,
+            }
+        }
+
+        pub fn write(&self, path: &str, bytes: &[u8]) {
+            std::fs::write(self.repo.workdir().join(path), bytes).unwrap();
+        }
+
+        pub fn commit_file(&self, path: &str, bytes: &[u8], message: &str) -> Sha {
+            self.write(path, bytes);
+            self.repo.stage(&[path]).unwrap();
+            self.repo.commit(message, false).unwrap()
+        }
+
+        pub fn remote_tip(&self, remote_branch: &str, sha: &str) {
+            self.repo
+                .repo
+                .reference(
+                    &format!("refs/remotes/{remote_branch}"),
+                    parse_oid(sha).unwrap(),
+                    true,
+                    "test: update remote-tracking ref",
+                )
+                .unwrap();
+        }
+    }
+
     #[test]
     fn stash_summary_drops_the_branch_prefix() {
         assert_eq!(

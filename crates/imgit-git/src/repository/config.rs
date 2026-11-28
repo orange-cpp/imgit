@@ -23,6 +23,26 @@ impl Repository {
             .unwrap_or(fallback)
     }
 
+    /// Whether sparse checkout is enabled for this worktree.
+    ///
+    /// The Git CLI can enable worktree-specific config after the repository was opened.
+    /// Read that file directly because libgit2 selects its config backends on first use.
+    #[must_use]
+    pub fn sparse_checkout_enabled(&self) -> bool {
+        let Some(config) = self.config_snapshot() else {
+            return false;
+        };
+        if config
+            .get_bool("extensions.worktreeConfig")
+            .unwrap_or(false)
+            && let Ok(worktree) = git2::Config::open(&self.git_dir().join("config.worktree"))
+            && let Ok(enabled) = worktree.get_bool("core.sparseCheckout")
+        {
+            return enabled;
+        }
+        config.get_bool("core.sparseCheckout").unwrap_or(false)
+    }
+
     /// Writes `key` to the repository's own `.git/config`; `None` (or an empty value) removes it.
     pub fn set_local_config(&self, key: &str, value: Option<&str>) -> Result<()> {
         let mut local = self.repo.config()?.open_level(git2::ConfigLevel::Local)?;
@@ -134,7 +154,27 @@ fn read_message_file(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_message_file;
+    use super::{Repository, read_message_file};
+
+    #[test]
+    fn sparse_checkout_prefers_worktree_config_only_when_the_extension_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let worktree = repo.git_dir().join("config.worktree");
+
+        repo.set_local_config("extensions.worktreeConfig", Some("false"))
+            .unwrap();
+        repo.set_local_config("core.sparseCheckout", Some("true"))
+            .unwrap();
+        std::fs::write(&worktree, "[core]\n\tsparseCheckout = false\n").unwrap();
+        assert!(repo.sparse_checkout_enabled());
+
+        repo.set_local_config("extensions.worktreeConfig", Some("true"))
+            .unwrap();
+        assert!(!repo.sparse_checkout_enabled());
+        std::fs::remove_file(worktree).unwrap();
+        assert!(repo.sparse_checkout_enabled());
+    }
 
     #[test]
     fn message_files_lose_comments_and_surrounding_blank_lines() {

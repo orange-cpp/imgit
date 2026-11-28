@@ -841,3 +841,42 @@ unsafe fn as_bytes<T>(slice: &[T]) -> &[u8] {
     // SAFETY: the caller's contract; the length is the slice's size in bytes.
     unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), size_of_val(slice)) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn tight_texture_uploads_borrow_only_the_declared_texels() {
+        let rgba = [1, 2, 3, 4, 5, 6, 7, 8, 100, 101];
+        let pixels = tight_rows(TextureFormat::RGBA32, 1, 2, 4, &rgba).unwrap();
+        assert!(matches!(pixels, Cow::Borrowed(row) if row == &rgba[..8]));
+        assert_eq!(
+            gl_formats(TextureFormat::RGBA32),
+            (glow::RGBA8 as i32, glow::RGBA)
+        );
+    }
+
+    #[test]
+    fn padded_texture_uploads_keep_visible_rows_and_reject_truncation() {
+        let padded = [3, 7, 99, 99, 11, 19];
+        let pixels = tight_rows(TextureFormat::Alpha8, 2, 2, 4, &padded).unwrap();
+        assert!(matches!(pixels, Cow::Owned(rows) if rows == [3, 7, 11, 19]));
+        assert_eq!(
+            gl_formats(TextureFormat::Alpha8),
+            (glow::R8 as i32, glow::RED)
+        );
+        assert!(tight_rows(TextureFormat::Alpha8, 2, 2, 1, &padded).is_err());
+        assert!(tight_rows(TextureFormat::Alpha8, 2, 2, 4, &padded[..5]).is_err());
+        assert!(tight_rows(TextureFormat::RGBA32, 1, 2, 4, &padded).is_err());
+    }
+
+    #[test]
+    fn only_nonzero_gl_names_can_be_converted_to_native_textures() {
+        let id = TextureId::new(u64::from(u32::MAX));
+        assert_eq!(texture_id(gl_texture(id).unwrap()), id);
+        assert!(gl_texture(TextureId::new(0)).is_none());
+        assert!(gl_texture(TextureId::new(u64::from(u32::MAX) + 1)).is_none());
+    }
+}

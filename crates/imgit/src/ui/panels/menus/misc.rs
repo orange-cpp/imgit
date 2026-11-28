@@ -516,3 +516,287 @@ pub fn text_input_menu(_cx: &mut Cx<'_>, read_only: bool) -> MenuItems {
         menu_item("Select All", chord(Key::A, true)),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imgit_git::Repository;
+
+    use crate::app::terminal::TerminalSession;
+    use crate::shell::test_frame::TestFrames;
+
+    fn choose(
+        frames: &mut TestFrames,
+        app: &mut Application,
+        label: &str,
+        menu: impl FnOnce(&mut Cx<'_>, &mut Application) -> MenuItems,
+    ) {
+        frames.draw(|cx| {
+            let item = menu(cx, app)
+                .into_iter()
+                .find(|item| item.label == label)
+                .unwrap_or_else(|| panic!("missing menu item {label:?}"));
+            assert!(item.enabled, "{label:?} is disabled");
+            item.click.unwrap()(cx, app);
+        });
+    }
+
+    #[test]
+    fn graph_column_items_protect_the_last_visible_column_and_persist_a_reset() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        {
+            let settings = &mut app.settings;
+            settings.show_author = false;
+            settings.show_date = false;
+            settings.show_sha = false;
+            settings.show_changes = false;
+            settings
+                .hidden_graph_columns
+                .extend(["ref".to_owned(), "message".to_owned()]);
+            settings.graph_column_order = vec!["changes".to_owned(), "graph".to_owned()];
+        }
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let menu = graph_header_menu(cx, &mut app);
+            let graph = menu.iter().find(|item| item.label == "Graph").unwrap();
+            assert!(graph.checked && !graph.enabled);
+        });
+        choose(&mut frames, &mut app, "Changes", graph_header_menu);
+        assert!(app.settings.show_changes);
+        choose(&mut frames, &mut app, "Graph", graph_header_menu);
+        assert!(app.settings.hidden_graph_columns.contains("graph"));
+        choose(
+            &mut frames,
+            &mut app,
+            "Reset columns to compact layout",
+            graph_header_menu,
+        );
+        assert!(app.settings.compact_graph);
+        assert!(app.settings.hidden_graph_columns.is_empty());
+        assert!(app.settings.graph_column_order.is_empty());
+        assert!(!app.settings.show_changes);
+        let mut saved = Settings::default();
+        saved.load(&app.config_path("settings.txt"));
+        assert!(saved.compact_graph);
+        assert!(saved.hidden_graph_columns.is_empty());
+        assert!(saved.graph_column_order.is_empty());
+    }
+
+    #[test]
+    fn section_visibility_and_folder_deletion_are_scoped_to_the_original_repository() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("original")).unwrap();
+        repo.set_local_config("user.name", Some("Menu test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("menu@example.invalid"))
+            .unwrap();
+        let head = repo.commit("Base", false).unwrap();
+        for name in ["topic/one", "topic/two", "outside"] {
+            repo.create_branch(name, &head, false).unwrap();
+        }
+        repo.create_tag("release", &head, None).unwrap();
+        let other = Repository::init(scratch.path().join("other")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&other.workdir().to_string_lossy());
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let sections = ["Local", "Tags", "Remote"].map(str::to_owned);
+        let mut frames = TestFrames::new();
+        let local = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| left_section_menu(cx, app, state, "Local", &sections))
+                .unwrap()
+        };
+        choose(&mut frames, &mut app, "Hide all local branches", local);
+        {
+            let state = app.active().unwrap();
+            assert_eq!(state.hidden_refs.len(), 3);
+            assert!(!state.head_ref().unwrap().hidden);
+            assert!(!state.find_ref("refs/tags/release").unwrap().hidden);
+        }
+        choose(&mut frames, &mut app, "Show all local branches", local);
+        assert!(app.active().unwrap().hidden_refs.is_empty());
+        app.active_mut()
+            .unwrap()
+            .expanded_left_sections
+            .insert("Tags".to_owned());
+        choose(&mut frames, &mut app, "Maximize this section", local);
+        let expanded = &app.active().unwrap().expanded_left_sections;
+        assert_eq!(expanded.len(), 1);
+        assert!(expanded.contains("Local"));
+        choose(&mut frames, &mut app, "Remote", local);
+        assert!(app.settings.hidden_left_sections.contains("Remote"));
+
+        choose(
+            &mut frames,
+            &mut app,
+            "Delete 2 branches in folder \"topic\"",
+            |cx, app| {
+                app.with_active(|app, state| local_folder_menu(cx, app, state, "topic"))
+                    .unwrap()
+            },
+        );
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert!(
+            app.active()
+                .unwrap()
+                .find_ref("refs/heads/topic/one")
+                .is_some()
+        );
+        app.active_tab = Some(0);
+        let confirmed = app.dialog.on_confirm.take().unwrap();
+        frames.draw(|cx| confirmed(cx, &mut app));
+        assert_eq!(app.active_workdir(), Some(other.workdir()));
+        app.with_repo(repo.workdir(), |_, state| {
+            assert!(state.find_ref("refs/heads/topic/one").is_none());
+            assert!(state.find_ref("refs/heads/topic/two").is_none());
+            assert!(state.find_ref("refs/heads/outside").is_some());
+            assert!(state.find_ref("refs/tags/release").is_some());
+            assert_eq!(state.history.head_sha.as_deref(), Some(head.as_str()));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_remote_menu_prefills_edit_and_removes_the_remote_only_after_confirmation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.add_remote("local", "../bare.git").unwrap();
+        repo.add_remote("other", "../other.git").unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let local = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| remote_menu(cx, app, state, "local", true))
+                .unwrap()
+        };
+        choose(&mut frames, &mut app, "Edit local", local);
+        assert!(app.dialog.is(DialogKind::EditRemote));
+        assert_eq!(app.dialog.text_a, "local");
+        assert_eq!(app.dialog.text_b, "../bare.git");
+        app.dialog.close();
+
+        choose(&mut frames, &mut app, "Remove local", local);
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert_eq!(app.dialog.title, "Remove Remote");
+        assert!(repo.config_string("remote.local.url").is_some());
+        let confirmed = app.dialog.on_confirm.take().unwrap();
+        frames.draw(|cx| confirmed(cx, &mut app));
+        assert!(repo.config_string("remote.local.url").is_none());
+        assert_eq!(
+            repo.config_string("remote.other.url").as_deref(),
+            Some("../other.git")
+        );
+        assert_eq!(app.active().unwrap().history.remotes.len(), 1);
+    }
+
+    #[test]
+    fn removing_a_worktree_through_the_menu_keeps_its_branch() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Worktree menu test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("worktree-menu@example.invalid"))
+            .unwrap();
+        let sha = repo.commit("Base", false).unwrap();
+        repo.create_branch("topic", &sha, false).unwrap();
+        let path = scratch.path().join("linked");
+        let added = imgit_git::cli::run(
+            repo.workdir(),
+            ["worktree", "add", "--", &path.to_string_lossy(), "topic"],
+            imgit_git::cli::RunOptions::default(),
+        );
+        assert!(added.success(), "{}", added.text);
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+
+        choose(&mut frames, &mut app, "Remove worktree", |cx, app| {
+            app.with_active(|app, state| {
+                let link = state
+                    .history
+                    .worktrees
+                    .iter()
+                    .find(|tree| Path::new(&tree.path) == path)
+                    .unwrap()
+                    .clone();
+                worktree_menu(cx, app, state, &link)
+            })
+            .unwrap()
+        });
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert!(app.dialog.message.contains("its branch stays"));
+        assert!(path.is_dir());
+
+        let confirm = app.dialog.on_confirm.take().unwrap();
+        frames.draw(|cx| confirm(cx, &mut app));
+        let operation = app.active().unwrap().async_op.as_ref().unwrap();
+        assert_eq!(operation.args.len(), 4);
+        assert_eq!(operation.args[..3], ["worktree", "remove", "--"]);
+        assert_eq!(Path::new(&operation.args[3]), path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree removal did not finish"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!path.exists());
+        let state = app.active().unwrap();
+        assert!(
+            state
+                .history
+                .worktrees
+                .iter()
+                .all(|tree| Path::new(&tree.path) != path)
+        );
+        assert_eq!(state.find_ref("refs/heads/topic").unwrap().target, sha);
+    }
+
+    #[test]
+    fn the_terminal_context_menu_updates_the_active_session_and_panel() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let mut session = TerminalSession::new(scratch.path().to_owned());
+        session.screen.feed(b"one\r\ntwo");
+        app.terminal_tabs(None).sessions.push(session);
+        app.show_terminal_panel = true;
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let menu = terminal_menu(cx, &mut app);
+            assert!(
+                !menu
+                    .iter()
+                    .find(|item| item.label == "Copy")
+                    .unwrap()
+                    .enabled
+            );
+        });
+
+        choose(&mut frames, &mut app, "Select All", terminal_menu);
+        frames.draw(|cx| {
+            let menu = terminal_menu(cx, &mut app);
+            assert!(
+                menu.iter()
+                    .find(|item| item.label == "Copy")
+                    .unwrap()
+                    .enabled
+            );
+        });
+        choose(&mut frames, &mut app, "Delete Line", terminal_menu);
+        assert_eq!(
+            app.active_terminal(None).unwrap().pending_input,
+            "\x1b[1;5H"
+        );
+        choose(&mut frames, &mut app, "Clear", terminal_menu);
+        assert!(!terminal_has_selection(&mut app));
+
+        choose(&mut frames, &mut app, "Minimize Terminal", terminal_menu);
+        assert!(app.terminal.minimized);
+        choose(&mut frames, &mut app, "Hide Terminal", terminal_menu);
+        assert!(!app.show_terminal_panel);
+        choose(&mut frames, &mut app, "Kill Terminal", terminal_menu);
+        assert!(app.terminal_tabs(None).sessions.is_empty());
+    }
+}

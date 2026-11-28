@@ -1098,6 +1098,139 @@ fn notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn the_notification_popover_filters_marks_and_deletes_the_requested_entries() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.toasts.push(ToastKind::Info, "Older");
+        app.toasts.mark_all_read();
+        app.toasts.push(ToastKind::Error, "Newer");
+        let mut frames = TestFrames::new();
+        let anchor = vec2(800.0, 45.0);
+        let origin = anchor + vec2(-450.0, 5.0);
+        let render =
+            |cx: &mut Cx<'_>, app: &mut Application| draw_notifications_popover(cx, app, anchor);
+        frames.draw(|cx| {
+            cx.open_popover("##notifications");
+            render(cx, &mut app);
+        });
+        let filter = origin + vec2(150.0, 25.0);
+        frames.click_left(filter, |cx| render(cx, &mut app));
+        assert!(app.panels.tab_popovers.filter_open);
+        let read = origin + vec2(170.0, 100.0);
+        frames.click_left(read, |cx| render(cx, &mut app));
+        assert_eq!(app.panels.tab_popovers.filter, Filter::Read);
+        assert!(!app.panels.tab_popovers.filter_open);
+
+        let first_eye = origin + vec2(383.0, 52.1 + 19.0);
+        frames.click_left(first_eye, |cx| render(cx, &mut app));
+        assert_eq!(app.toasts.unread(), 2);
+        assert!(
+            !app.toasts
+                .history()
+                .iter()
+                .find(|entry| entry.title == "Older")
+                .unwrap()
+                .read
+        );
+
+        frames.click_left(filter, |cx| render(cx, &mut app));
+        let unread = origin + vec2(170.0, 137.0);
+        frames.click_left(unread, |cx| render(cx, &mut app));
+        assert_eq!(app.panels.tab_popovers.filter, Filter::Unread);
+        let first_trash = origin + vec2(421.0, 52.1 + 19.0);
+        frames.click_left(first_trash, |cx| render(cx, &mut app));
+        assert_eq!(app.toasts.history().len(), 1);
+        assert_eq!(app.toasts.history()[0].title, "Older");
+        assert_eq!(app.toasts.unread(), 1);
+    }
+
+    #[test]
+    fn notifications_can_be_scrolled_by_wheel_and_by_dragging_the_scrollbar() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        for index in 0..30 {
+            app.toasts
+                .push_with_detail(ToastKind::Info, format!("Notification {index}"), "Detail");
+        }
+        let mut frames = TestFrames::new();
+        let anchor = vec2(800.0, 45.0);
+        let origin = anchor + vec2(-450.0, 5.0);
+        let render =
+            |cx: &mut Cx<'_>, app: &mut Application| draw_notifications_popover(cx, app, anchor);
+        frames.draw(|cx| {
+            cx.open_popover("##notifications");
+            render(cx, &mut app);
+        });
+        frames.move_mouse((origin + vec2(200.0, 160.0)).into());
+        frames.draw(|cx| render(cx, &mut app));
+        frames.scroll_vertical(-3.0);
+        frames.draw(|cx| render(cx, &mut app));
+        let state = &app.panels.tab_popovers;
+        assert_eq!(state.notifications_scroll, 3.0 * WHEEL_STEP);
+
+        let scrollbar_x = 450.0 - SCROLLBAR_MARGIN - SCROLLBAR_WIDTH / 2.0;
+        frames.move_mouse((origin + vec2(scrollbar_x, 280.0)).into());
+        frames.draw(|cx| render(cx, &mut app));
+        frames.set_left_mouse(true);
+        frames.draw(|cx| render(cx, &mut app));
+        let pressed = app.panels.tab_popovers.notifications_scroll;
+        frames.move_mouse((origin + vec2(scrollbar_x, 700.0)).into());
+        frames.draw(|cx| render(cx, &mut app));
+        assert!(app.panels.tab_popovers.notifications_scroll > pressed);
+        frames.set_left_mouse(false);
+        frames.draw(|cx| render(cx, &mut app));
+        assert_eq!(app.toasts.history().len(), 30);
+    }
+
+    #[test]
+    fn the_toolbar_profile_popover_selects_a_profile_and_opens_profile_preferences() {
+        use imgit_app::profiles::Profile;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let original = app.profiles.current().guid.clone();
+        let created = app
+            .profiles
+            .create(
+                Profile {
+                    name: "Z Test profile".to_owned(),
+                    user_name: "Test Author".to_owned(),
+                    user_email: "test@example.invalid".to_owned(),
+                    ..Profile::default()
+                },
+                false,
+            )
+            .unwrap();
+
+        let mut frames = TestFrames::new();
+        let anchor = vec2(840.0, 45.0);
+        let origin = anchor + vec2(-330.0, 5.0);
+        let render = |cx: &mut Cx<'_>, app: &mut Application| draw_profile_popover(cx, app, anchor);
+        let open = |cx: &mut Cx<'_>, app: &mut Application| {
+            cx.open_popover("##profile_menu");
+            render(cx, app);
+        };
+        frames.draw(|cx| open(cx, &mut app));
+        frames.click_left(origin + vec2(140.0, 82.0), |cx| render(cx, &mut app));
+        frames.set_key(Key::DownArrow, true);
+        frames.draw(|cx| render(cx, &mut app));
+        frames.set_key(Key::DownArrow, false);
+        frames.draw(|cx| render(cx, &mut app));
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| render(cx, &mut app));
+        assert_eq!(app.pending_profile.as_deref(), Some(created.as_str()));
+        assert_eq!(app.profiles.current().guid, original);
+
+        frames.set_key(Key::Enter, false);
+        frames.draw(|cx| open(cx, &mut app));
+        frames.click_left(origin + vec2(150.0, 205.0), |cx| render(cx, &mut app));
+        assert!(app.preferences_open);
+        assert_eq!(app.preferences_page, "Profiles");
+    }
     use crate::ui::icons::Icons;
 
     fn entry(read: bool, title: &str, detail: &str) -> Entry {

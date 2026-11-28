@@ -1175,7 +1175,7 @@ impl State {
 
     /// The inline "enter branch name" / "enter tag name" input in the ref zone of the row at `y0`.
     fn draw_inline_ref(
-        &self,
+        &mut self,
         cx: &mut Cx<'_>,
         slot: &mut Option<InlineRef>,
         f: &mut RowFrame,
@@ -1190,6 +1190,11 @@ impl State {
         let Some(inline_ref) = slot.as_mut() else {
             return;
         };
+        if inline_ref.focus && inline_ref.name.is_empty() {
+            // Each new prompt gets its own ImGui text edit state, so a canceled name cannot reappear.
+            self.inline_ref_input_id = self.inline_ref_input_id.wrapping_add(1);
+        }
+        let _id = ui.push_id(self.inline_ref_input_id);
         // .form-control in the ref zone: the whole zone and row, rgba(0,0,0,.2), a 1px #4D88FF focus border,
         // radius 4, 12px text 12px in. With the ref zone hidden, the input takes the first column's place.
         let box_zone = if z.w(ZoneType::Ref) > 0.0 {

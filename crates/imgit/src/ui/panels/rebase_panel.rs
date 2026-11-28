@@ -1016,6 +1016,148 @@ fn draw_footer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    fn rebase_fixture() -> (tempfile::TempDir, Application, String) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Rebase test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("rebase@example.invalid"))
+            .unwrap();
+        let mut base = String::new();
+        for label in ["base", "first", "second", "third"] {
+            std::fs::write(repo.workdir().join(label), label).unwrap();
+            repo.stage(&[label]).unwrap();
+            let sha = repo.commit(label, false).unwrap();
+            if label == "base" {
+                base = sha;
+            }
+        }
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, app, base)
+    }
+
+    #[test]
+    fn rebase_shortcuts_reorder_and_drop_steps_then_start_and_undo_the_plan() {
+        let (_scratch, mut app, base) = rebase_fixture();
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            let original = state.history.head_sha.clone();
+            state.start_rebase_plan(&base, "base", None, None);
+            let size = vec2(1000.0, 520.0);
+            let draw = |frames: &mut TestFrames, app: &mut Application, state: &mut RepoState| {
+                let mut start = Vec2::ZERO;
+                frames.draw(|cx| {
+                    start =
+                        cx.cursor() + vec2(size.x - PADDING - 18.0, size.y - FOOTER_HEIGHT + 28.0);
+                    draw_rebase_panel(cx, app, state, size);
+                });
+                start
+            };
+            draw(&mut frames, app, state);
+            assert_eq!(state.rebase.selected, Some(2));
+
+            frames.set_key(Key::ModCtrl, true);
+            frames.set_key(Key::DownArrow, true);
+            draw(&mut frames, app, state);
+            assert_eq!(state.rebase.selected, Some(1));
+            assert_eq!(state.rebase.steps[1].summary, "third");
+            assert_eq!(state.rebase.steps[2].summary, "second");
+            frames.set_key(Key::DownArrow, false);
+            frames.set_key(Key::ModCtrl, false);
+            draw(&mut frames, app, state);
+
+            frames.set_key(Key::DownArrow, true);
+            draw(&mut frames, app, state);
+            assert_eq!(state.rebase.selected, Some(0));
+            frames.set_key(Key::DownArrow, false);
+            draw(&mut frames, app, state);
+            frames.set_key(Key::D, true);
+            let start = draw(&mut frames, app, state);
+            assert!(matches!(
+                state.rebase.steps[0].step.action,
+                RebaseAction::Drop
+            ));
+            frames.set_key(Key::D, false);
+
+            frames.click_left(start, |cx| draw_rebase_panel(cx, app, state, size));
+            assert!(!state.rebase.active);
+            assert_eq!(app.toasts.history()[0].title, "Rebase complete");
+            assert_eq!(state.undo_stack.len(), 1);
+            let summaries = |state: &RepoState| {
+                state
+                    .commits_above(Some(&base), None)
+                    .into_iter()
+                    .map(|commit| commit.summary.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(summaries(state), ["third", "second"]);
+            assert!(!state.repo.workdir().join("first").exists());
+            assert!(state.repo.workdir().join("third").exists());
+
+            app.undo(state);
+            assert_eq!(state.history.head_sha, original);
+            assert_eq!(summaries(state), ["first", "second", "third"]);
+            assert!(state.repo.workdir().join("first").is_file());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_reword_editor_updates_the_plan_and_reset_discards_the_edit() {
+        let (_scratch, mut app, base) = rebase_fixture();
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.start_rebase_plan(&base, "base", None, None);
+            let size = vec2(1000.0, 520.0);
+            let mut reset_button = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    let width = |text| text_w(cx, cx.fonts.semibold, 12.0, text) + cx.px(24.0);
+                    reset_button = cx.cursor()
+                        + vec2(
+                            size.x
+                                - PADDING
+                                - width("Start Rebase")
+                                - width("Cancel Rebase")
+                                - 40.0
+                                - 18.0,
+                            size.y - FOOTER_HEIGHT + 28.0,
+                        );
+                    draw_rebase_panel(cx, app, state, size);
+                });
+            }
+            frames.set_key(Key::R, true);
+            frames.draw(|cx| draw_rebase_panel(cx, app, state, size));
+            assert_eq!(state.rebase.editing, Some(2));
+            frames.set_key(Key::R, false);
+            for _ in 0..3 {
+                frames.draw(|cx| draw_rebase_panel(cx, app, state, size));
+            }
+
+            frames.set_key(Key::End, true);
+            frames.draw(|cx| draw_rebase_panel(cx, app, state, size));
+            frames.set_key(Key::End, false);
+            frames.draw(|cx| draw_rebase_panel(cx, app, state, size));
+            frames.type_text(" updated");
+            frames.draw(|cx| draw_rebase_panel(cx, app, state, size));
+            frames.set_key(Key::Enter, true);
+            frames.draw(|cx| draw_rebase_panel(cx, app, state, size));
+            assert_eq!(state.rebase.editing, None);
+            assert_eq!(
+                state.rebase.steps[2].step.action,
+                RebaseAction::Reword(Some("third updated".to_owned()))
+            );
+
+            frames.set_key(Key::Enter, false);
+            frames.click_left(reset_button, |cx| draw_rebase_panel(cx, app, state, size));
+            assert!(state.rebase.active);
+            assert_eq!(state.rebase.steps, state.rebase.original_steps);
+        })
+        .unwrap();
+    }
 
     #[test]
     fn undoing_a_rebase_keeps_the_changes_made_since() {

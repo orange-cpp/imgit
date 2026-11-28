@@ -19,7 +19,7 @@ use crate::ui::draw::DrawList;
 use crate::ui::icons::svg_path;
 use crate::ui::menu::popup_menu;
 use crate::ui::panels::menus;
-use crate::ui::{Cx, Vec2, raw, vec2};
+use crate::ui::{Cx, Rect, Vec2, raw, vec2};
 
 const TOOLBAR_HEIGHT: f32 = 30.0;
 /// `.terminal-panel { padding: 1.2rem 0 1.2rem 1.2rem }`.
@@ -673,7 +673,8 @@ fn draw_contents(
         return;
     }
     let session = &mut tabs.sessions[tabs.active];
-    draw_body(cx, app, session, outcome, origin, size, border, bar_h);
+    let area = Rect::new(origin + vec2(0.0, bar_h), origin + size);
+    draw_body(cx, app, session, outcome, area, border);
     let _ = ui;
 }
 
@@ -866,46 +867,53 @@ fn word_range(cells: &[Cell], column: usize) -> Option<(usize, usize)> {
     Some((from, to + 1))
 }
 
-/// The terminal: a 1px top / left border, 12px padding, then the cell grid and a 10px ruler on the right.
-#[allow(clippy::too_many_arguments)]
+/// The terminal body and visible cell grid in device pixels.
+struct TerminalGrid {
+    area: Rect,
+    origin: Vec2,
+    metrics: CellMetrics,
+    cell_w: f32,
+    cell_h: f32,
+    width: f32,
+    columns: usize,
+    rows: usize,
+}
+
+impl TerminalGrid {
+    fn new(cx: &Cx<'_>, area: Rect) -> Self {
+        let origin = area.min + vec2(1.0 + cx.px(PADDING), 1.0 + cx.px(PADDING));
+        let metrics = cell_metrics(cx);
+        let cell_w = cx.px(metrics.width).floor();
+        let cell_h = cx.px(metrics.height).floor();
+        let width = area.max.x - origin.x - cx.px(RULER_WIDTH);
+        let height = area.max.y - cx.px(PADDING) - origin.y;
+        Self {
+            area,
+            origin,
+            metrics,
+            cell_w,
+            cell_h,
+            width,
+            columns: ((width / cell_w) as usize).max(2),
+            rows: ((height / cell_h) as usize).max(1),
+        }
+    }
+}
+
+/// The terminal's border and shell lifecycle around the cell grid.
 fn draw_body(
     cx: &mut Cx<'_>,
     app: &mut Application,
     session: &mut TerminalSession,
     outcome: &mut Outcome,
-    origin: Vec2,
-    size: Vec2,
+    area: Rect,
     border: Color,
-    bar_h: f32,
 ) {
-    let ui = cx.ui;
-    let p = cx.palette;
     let draw = cx.window_draw_list();
-    let right = origin.x + size.x;
-    let body_top = origin.y + bar_h;
-    draw.add_rect_filled(
-        vec2(origin.x, body_top),
-        vec2(right, body_top + 1.0),
-        border,
-        0.0,
-    );
-    draw.add_rect_filled(
-        vec2(origin.x, body_top),
-        vec2(origin.x + 1.0, origin.y + size.y),
-        border,
-        0.0,
-    );
-    let grid = vec2(
-        origin.x + 1.0 + cx.px(PADDING),
-        body_top + 1.0 + cx.px(PADDING),
-    );
-    let metrics = cell_metrics(cx);
-    let cell_w = cx.px(metrics.width).floor();
-    let cell_h = cx.px(metrics.height).floor();
-    let grid_w = right - grid.x - cx.px(RULER_WIDTH);
-    let grid_h = origin.y + size.y - cx.px(PADDING) - grid.y;
-    let columns = ((grid_w / cell_w) as usize).max(2);
-    let rows = ((grid_h / cell_h) as usize).max(1);
+    draw.add_rect_filled(area.min, vec2(area.max.x, area.min.y + 1.0), border, 0.0);
+    draw.add_rect_filled(area.min, vec2(area.min.x + 1.0, area.max.y), border, 0.0);
+    let layout = TerminalGrid::new(cx, area);
+    let (columns, rows) = (layout.columns, layout.rows);
     if !session.started() && !session.failed {
         session.screen.resize(columns, rows);
         let shell = terminal_shell(&preferences().get(pref::TERMINAL_SHELL));
@@ -937,18 +945,32 @@ fn draw_body(
         text_at(
             cx,
             draw,
-            grid.x,
-            grid.y,
+            layout.origin.x,
+            layout.origin.y,
             Color::rgb(ANSI[1]),
             "Failed to start shell process",
         );
         return;
     }
 
+    draw_grid(cx, app, session, outcome, &layout);
+}
+
+fn draw_grid(
+    cx: &mut Cx<'_>,
+    app: &mut Application,
+    session: &mut TerminalSession,
+    outcome: &mut Outcome,
+    layout: &TerminalGrid,
+) {
+    let ui = cx.ui;
+    let p = cx.palette;
+    let draw = cx.window_draw_list();
+    let grid = layout.origin;
+    let (cell_w, cell_h, rows) = (layout.cell_w, layout.cell_h, layout.rows);
     // Focus: a click in the panel takes it, a click anywhere else (or another text field) gives it up.
-    let (area_min, area_max) = (vec2(origin.x, body_top), vec2(right, origin.y + size.y));
-    let mouse_inside =
-        ui.is_mouse_hovering_rect(area_min.into(), area_max.into()) && ui.is_window_hovered();
+    let mouse_inside = ui.is_mouse_hovering_rect(layout.area.min.into(), layout.area.max.into())
+        && ui.is_window_hovered();
     let was_focused = app.terminal.focused;
     if app.terminal.focus_requested {
         app.terminal.focused = true;
@@ -976,7 +998,7 @@ fn draw_body(
     session.scrolled_seen = session.screen.scrolled_lines();
     let wheel = ui.io().mouse_wheel();
     if mouse_inside && wheel != 0.0 {
-        let lines = (wheel * 100.0 / metrics.height).round() as isize;
+        let lines = (wheel * 100.0 / layout.metrics.height).round() as isize;
         if session.screen.alternate_screen() {
             let application = session.screen.application_cursor_keys();
             let key = match (lines > 0, application) {
@@ -997,7 +1019,7 @@ fn draw_body(
     cx.set_cursor(grid);
     ui.invisible_button(
         "##terminal_grid",
-        [grid_w + cx.px(RULER_WIDTH), cell_h * rows as f32],
+        [layout.width + cx.px(RULER_WIDTH), cell_h * rows as f32],
     );
     let screen_columns = session.screen.columns();
     let first_line = session.screen.first_line_id();
@@ -1053,9 +1075,7 @@ fn draw_body(
         outcome.copy = Some(text);
     }
 
-    draw_cells(
-        cx, session, focused, grid, cell_w, cell_h, rows, top_index, &metrics,
-    );
+    draw_cells(cx, session, focused, layout, top_index);
 
     // The scrollbar: a 10px slider in the ruler column while there is scrollback.
     if scrollback > 0 {
@@ -1063,7 +1083,7 @@ fn draw_body(
         let total = session.screen.line_count() as f32;
         let slider_h = cx.px(20.0).max(track_h * rows as f32 / total);
         let slider_top = grid.y + (track_h - slider_h) * top_index as f32 / scrollback as f32;
-        let sx = right - cx.px(RULER_WIDTH) - 1.0;
+        let sx = layout.area.max.x - cx.px(RULER_WIDTH) - 1.0;
         draw.add_rect_filled(
             vec2(sx, slider_top.round()),
             vec2(sx + cx.px(RULER_WIDTH), (slider_top + slider_h).round()),
@@ -1075,18 +1095,16 @@ fn draw_body(
 
 /// The cells: backgrounds, the selection, glyphs, underlines, then the cursor; 60% while unfocused (unless Dim
 /// when unfocused is off).
-#[allow(clippy::too_many_arguments)]
 fn draw_cells(
     cx: &Cx<'_>,
     session: &TerminalSession,
     focused: bool,
-    grid: Vec2,
-    cell_w: f32,
-    cell_h: f32,
-    rows: usize,
+    layout: &TerminalGrid,
     top_index: usize,
-    metrics: &CellMetrics,
 ) {
+    let grid = layout.origin;
+    let (cell_w, cell_h, rows) = (layout.cell_w, layout.cell_h, layout.rows);
+    let metrics = &layout.metrics;
     let p = cx.palette;
     let draw = cx.window_draw_list();
     let screen: &Screen = &session.screen;
@@ -1260,6 +1278,104 @@ mod tests {
                 ..Cell::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_terminal_grid_copies_a_drag_selection_and_routes_input_to_the_session() {
+        use crate::shell::test_frame::TestFrames;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let mut session = TerminalSession::new(scratch.path().to_path_buf());
+        let mut frames = TestFrames::new();
+        let mut begin = Vec2::ZERO;
+        let mut end = Vec2::ZERO;
+        let mut outcome = Outcome::default();
+        let layout = |cx: &Cx<'_>| {
+            TerminalGrid::new(cx, Rect::from_pos_size(cx.cursor(), vec2(600.0, 360.0)))
+        };
+        frames.draw(|cx| {
+            let grid = layout(cx);
+            session.screen.resize(grid.columns, grid.rows);
+            session
+                .screen
+                .feed(b"\x1b[?1004h\x1b[?1h\x1b[1;31;44;4;9malpha\x1b[0m beta");
+            begin = grid.origin + vec2(0.25 * grid.cell_w, grid.cell_h / 2.0);
+            end = begin + vec2(5.0 * grid.cell_w, 0.0);
+        });
+        let mut draw =
+            |frames: &mut TestFrames, app: &mut Application, session: &mut TerminalSession| {
+                frames.draw(|cx| draw_grid(cx, app, session, &mut outcome, &layout(cx)));
+            };
+
+        frames.move_mouse(begin.into());
+        draw(&mut frames, &mut app, &mut session);
+        frames.set_left_mouse(true);
+        draw(&mut frames, &mut app, &mut session);
+        assert!(app.terminal.focused);
+        assert_eq!(session.pending_input, "\x1b[I");
+
+        frames.move_mouse(end.into());
+        draw(&mut frames, &mut app, &mut session);
+        frames.set_left_mouse(false);
+        draw(&mut frames, &mut app, &mut session);
+        assert_eq!(selection_text(&session).as_deref(), Some("alpha"));
+
+        frames.set_key(Key::ModCtrl, true);
+        frames.set_key(Key::C, true);
+        draw(&mut frames, &mut app, &mut session);
+        assert!(session.selection.is_none());
+        frames.set_key(Key::C, false);
+        frames.set_key(Key::ModCtrl, false);
+        draw(&mut frames, &mut app, &mut session);
+        assert_eq!(session.pending_input, "\x1b[I");
+
+        frames.type_text("Ã©");
+        frames.set_key(Key::UpArrow, true);
+        draw(&mut frames, &mut app, &mut session);
+        assert_eq!(session.pending_input, "\x1b[I\x1bOAÃ©");
+        assert_eq!(outcome.copy.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn terminal_toolbar_can_select_minimize_and_close_failed_sessions() {
+        use crate::shell::test_frame::TestFrames;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let tabs = app.terminal_tabs(None);
+        for label in ["A", "B"] {
+            let mut session = TerminalSession::new(scratch.path().to_path_buf());
+            session.failed = true;
+            session.shell_label = Some(label.to_owned());
+            tabs.sessions.push(session);
+        }
+
+        let mut frames = TestFrames::new();
+        let size = vec2(600.0, 250.0);
+        let mut select = Vec2::ZERO;
+        let mut minimize = Vec2::ZERO;
+        let mut close = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let origin = cx.cursor();
+                // A single-character tab title leaves it at the minimum width, 48px.
+                select = origin + vec2(10.0 + 48.0 + 2.0 + 10.0, TOOLBAR_HEIGHT / 2.0);
+                close = origin + vec2(10.0 + 48.0 + 2.0 + 40.0, TOOLBAR_HEIGHT / 2.0);
+                minimize = origin + vec2(size.x - 72.0, TOOLBAR_HEIGHT / 2.0);
+                draw_terminal_panel(cx, &mut app, None, size);
+            });
+        }
+        frames.click_left(select, |cx| draw_terminal_panel(cx, &mut app, None, size));
+        assert_eq!(app.terminal_tabs(None).active, 1);
+        frames.click_left(minimize, |cx| draw_terminal_panel(cx, &mut app, None, size));
+        assert!(app.terminal.minimized);
+        frames.click_left(minimize, |cx| draw_terminal_panel(cx, &mut app, None, size));
+        assert!(!app.terminal.minimized);
+        frames.click_left(close, |cx| draw_terminal_panel(cx, &mut app, None, size));
+        let tabs = app.terminal_tabs(None);
+        assert_eq!((tabs.active, tabs.sessions.len()), (0, 1));
+        assert_eq!(tabs.sessions[0].shell_label.as_deref(), Some("A"));
     }
 
     #[test]

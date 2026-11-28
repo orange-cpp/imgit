@@ -1223,6 +1223,87 @@ mod tests {
     }
 
     #[test]
+    fn picking_a_side_then_saving_stages_the_resolved_file() {
+        use crate::shell::test_frame::TestFrames;
+        use imgit_git::{Repository, repository::Outcome};
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Merge test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("merge@example.invalid"))
+            .unwrap();
+        let filename = "conflict.txt";
+        let file = repo.workdir().join(filename);
+        let commit_text = |message, text| {
+            std::fs::write(&file, text).unwrap();
+            repo.stage(&[filename]).unwrap();
+            repo.commit(message, false).unwrap()
+        };
+        let base = commit_text("Base", "before\nbase\nafter\n");
+        repo.create_branch("theirs", &base, true).unwrap();
+        commit_text("Their change", "before\ntheirs\nafter\n");
+        repo.create_branch("ours", &base, true).unwrap();
+        commit_text("Our change", "before\nours\nafter\n");
+        assert_eq!(repo.merge("theirs", false).unwrap(), Outcome::Conflicts);
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            assert!(state.open_merge_tool(filename).unwrap());
+            let size = vec2(900.0, 520.0);
+            let draw = |frames: &mut TestFrames, app: &mut Application, state: &mut RepoState| {
+                let mut origin = Vec2::default();
+                frames.draw(|cx| {
+                    origin = cx.cursor();
+                    draw_merge_view(cx, app, state, size);
+                });
+                origin
+            };
+
+            draw(&mut frames, app, state);
+            let origin = draw(&mut frames, app, state);
+            let save = origin + vec2(size.x - 50.0, 20.0);
+            let pick_theirs = origin + vec2(size.x / 2.0 + 18.0, HEADER_H.round() + 20.0);
+            let click = |frames: &mut TestFrames,
+                         app: &mut Application,
+                         state: &mut RepoState,
+                         position: Vec2| {
+                frames.move_mouse(position.into());
+                draw(frames, app, state);
+                frames.set_left_mouse(true);
+                draw(frames, app, state);
+                frames.set_left_mouse(false);
+                draw(frames, app, state);
+            };
+
+            click(&mut frames, app, state, save);
+            assert!(app.dialog.is(DialogKind::Confirm));
+            assert_eq!(app.dialog.title, "Save with unresolved conflicts");
+            assert_eq!(state.repo.load_status().unwrap().conflicted.len(), 1);
+            app.dialog.close();
+
+            click(&mut frames, app, state, pick_theirs);
+            let tool = state.merge_tool.as_ref().unwrap();
+            assert_eq!(tool.unresolved_count(), 0);
+            assert_eq!(tool.output_text(), "before\ntheirs\nafter\n");
+
+            click(&mut frames, app, state, save);
+            assert!(state.merge_tool.is_none());
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "before\ntheirs\nafter\n"
+            );
+            let status = state.repo.load_status().unwrap();
+            assert!(status.conflicted.is_empty());
+            assert_eq!(status.staged.len(), 1);
+            assert_eq!(status.staged[0].path, filename);
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn visible_lines_follow_the_clip_rectangle() {
         // 10 lines of 16px from y = 100; a window showing y 120..170 (lines 1 to 4).
         assert_eq!(visible_range(120.0, 170.0, 100.0, 16.0, 10), 1..5);

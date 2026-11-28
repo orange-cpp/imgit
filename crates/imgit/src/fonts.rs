@@ -77,6 +77,29 @@ pub struct Fonts {
 }
 
 impl Fonts {
+    #[cfg(test)]
+    pub(crate) fn for_test(imgui: &Context) -> Self {
+        let id = imgui.font_atlas().add_font(&[FontSource::default_font()]);
+        let font = Font {
+            id,
+            em_scale: 1.0,
+            raw: last_font(imgui),
+        };
+        Self {
+            regular: font,
+            semibold: font,
+            bold: font,
+            italic: font,
+            mono: font,
+            system: font,
+            arial: font,
+            editor: font,
+            terminal: font,
+            dpi_scale: 1.0,
+            subpixel: false,
+        }
+    }
+
     /// The pixel height ImGui draws `font` at for a CSS size, DPI scale included: what the draw list's
     /// `add_text_with_font` takes (`ui::font_px` in C++).
     #[must_use]

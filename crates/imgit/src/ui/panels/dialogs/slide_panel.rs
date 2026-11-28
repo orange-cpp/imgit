@@ -739,6 +739,425 @@ fn ask_to_delete(app: &mut Application, state: &RepoState, submodule: &Submodule
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn editing_the_submodule_url_saves_it_without_changing_the_recorded_commit() {
+        use imgit_git::{Repository, cli};
+
+        let scratch = tempfile::tempdir().unwrap();
+        let dependency = Repository::init(scratch.path().join("dependency")).unwrap();
+        let repo = Repository::init(scratch.path().join("app")).unwrap();
+        for repository in [&dependency, &repo] {
+            repository
+                .set_local_config("user.name", Some("Submodule test"))
+                .unwrap();
+            repository
+                .set_local_config("user.email", Some("submodule@example.invalid"))
+                .unwrap();
+        }
+        let dependency_head = dependency.commit("Dependency", false).unwrap();
+        let path = "vendor/lib";
+        let url = dependency.workdir().to_string_lossy().replace('\\', "/");
+        let added = cli::run(
+            repo.workdir(),
+            [
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--",
+                &url,
+                path,
+            ],
+            cli::RunOptions::default(),
+        );
+        assert!(added.success(), "{}", added.text);
+        repo.commit("Add dependency", false).unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        app.settings
+            .hidden_left_sections
+            .extend(["Remote", "Worktrees", "Tags"].map(str::to_owned));
+
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.expanded_left_sections.insert("Submodules".to_owned());
+            let sidebar = |cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState| {
+                crate::ui::panels::left_panel::draw_left_panel(
+                    cx,
+                    app,
+                    state,
+                    vec2(330.0, 620.0),
+                    true,
+                );
+            };
+            let mut row = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    // The filter, two section headers, then the first submodule.
+                    row = cx.cursor() + vec2(84.0, 63.0 + 60.0 + 12.0);
+                    sidebar(cx, app, state);
+                });
+            }
+            frames.move_mouse(row.into());
+            frames.draw(|cx| sidebar(cx, app, state));
+            for _ in 0..2 {
+                frames.set_left_mouse(true);
+                frames.draw(|cx| sidebar(cx, app, state));
+                frames.set_left_mouse(false);
+                frames.draw(|cx| sidebar(cx, app, state));
+            }
+            assert_eq!(state.left_selected.as_deref(), Some("submodule:vendor/lib"));
+        })
+        .unwrap();
+        assert!(app.dialog.is(DialogKind::EditSubmodule));
+        assert_eq!(app.dialog.text_a, url);
+        assert_eq!(app.dialog.text_b, path);
+        frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+        let mut origin = Vec2::ZERO;
+        let update_url = "../moved.git";
+        app.with_active(|app, state| {
+            let draw = |cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState| {
+                super::super::draw_slide_panel(cx, app, state, cx.cursor(), 620.0, 680.0);
+            };
+            for _ in 0..3 {
+                frames.draw(|cx| {
+                    origin = cx.cursor();
+                    draw(cx, app, state);
+                });
+            }
+            let original = &state.history.submodules[0];
+            assert!(original.in_sync());
+            assert_eq!(original.recorded.as_deref(), Some(dependency_head.as_str()));
+
+            frames.click_left(origin + vec2(60.0, 96.0), |cx| draw(cx, app, state));
+            frames.set_key(Key::ModCtrl, true);
+            frames.set_key(Key::A, true);
+            frames.draw(|cx| draw(cx, app, state));
+            frames.set_key(Key::A, false);
+            frames.set_key(Key::ModCtrl, false);
+            frames.draw(|cx| draw(cx, app, state));
+            frames.type_text(update_url);
+            frames.draw(|cx| draw(cx, app, state));
+            assert_eq!(app.dialog.text_a, update_url);
+            frames.click_left(origin + vec2(60.0, 220.0), |cx| draw(cx, app, state));
+            assert!(!app.dialog.is_open());
+            let operation = state.async_op.as_ref().unwrap();
+            assert_eq!(
+                operation.args,
+                ["submodule", "set-url", "--", path, update_url]
+            );
+        })
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "submodule update did not finish"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let submodules = repo.submodules();
+        let updated = &submodules[0];
+        assert_eq!(updated.url, update_url);
+        assert_eq!(updated.recorded.as_deref(), Some(dependency_head.as_str()));
+        assert_eq!(
+            updated.checked_out.as_deref(),
+            Some(dependency_head.as_str())
+        );
+    }
+
+    #[test]
+    fn updating_from_the_panel_checks_out_the_recorded_revision_and_can_open_it() {
+        let (_scratch, dependency, repo, mut app, old, recorded) = submodule_fixture();
+        let path = "vendor/lib";
+        let module = imgit_git::Repository::open(repo.workdir().join(path)).unwrap();
+        module.checkout_commit(&old).unwrap();
+        app.active_mut().unwrap().refresh();
+        let current = &app.active().unwrap().history.submodules[0];
+        assert_eq!(current.recorded.as_deref(), Some(recorded.as_str()));
+        assert_eq!(current.checked_out.as_deref(), Some(old.as_str()));
+        assert!(!current.in_sync());
+
+        edit_submodule(&mut app, path, &dependency.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        let mut revision_label_height = 0.0;
+        for _ in 0..4 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                revision_label_height = cx.text_size(cx.fonts.regular, 14.0, "Current Revision").y;
+                render_submodule_panel(cx, &mut app);
+            });
+        }
+        frames.click_left(origin + vec2(300.0, 314.0), |cx| {
+            render_submodule_panel(cx, &mut app)
+        });
+        let operation = app.active().unwrap().async_op.as_ref().unwrap();
+        assert_eq!(operation.title, "Update submodule");
+        assert_eq!(operation.args, ["submodule", "update", "--", path]);
+        finish_submodule_command(&mut app);
+        assert!(app.dialog.is(DialogKind::EditSubmodule));
+        let submodule = &app.active().unwrap().history.submodules[0];
+        assert!(submodule.in_sync());
+        assert_eq!(submodule.checked_out.as_deref(), Some(recorded.as_str()));
+        assert_eq!(
+            imgit_git::Repository::open(module.workdir())
+                .unwrap()
+                .head_commit_message()
+                .unwrap(),
+            "Recorded revision"
+        );
+
+        // Without the update row, the open button follows the one-line commit message box.
+        let open = origin + vec2(155.0, 410.0 + revision_label_height);
+        frames.click_left(open, |cx| render_submodule_panel(cx, &mut app));
+        assert!(!app.dialog.is_open());
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_workdir(), Some(module.workdir()));
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(recorded.as_str())
+        );
+        assert_eq!(app.active().unwrap().root().repo.workdir(), repo.workdir());
+    }
+
+    #[test]
+    fn deleting_a_recorded_submodule_requires_confirmation_and_stages_only_its_removal() {
+        let (_scratch, dependency, repo, mut app, _, recorded) = submodule_fixture();
+        let path = "vendor/lib";
+        let folder = repo.workdir().join(path);
+        std::fs::write(repo.workdir().join("unrelated.txt"), "Keep this file\n").unwrap();
+        edit_submodule(&mut app, path, &dependency.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let mut delete = Vec2::ZERO;
+        for _ in 0..4 {
+            frames.draw(|cx| {
+                let label_h = cx.text_size(cx.fonts.regular, 14.0, "Current Revision").y;
+                delete = cx.cursor() + vec2(450.0, 410.0 + label_h);
+                render_submodule_panel(cx, &mut app);
+            });
+        }
+        frames.click_left(delete, |cx| render_submodule_panel(cx, &mut app));
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert_eq!(app.dialog.title, "Delete submodule");
+        assert_eq!(app.dialog.workdir.as_deref(), Some(repo.workdir()));
+        assert!(
+            app.dialog
+                .message
+                .contains("Its folder and its entry in .gitmodules are removed")
+        );
+        assert!(app.dialog.danger);
+        assert!(folder.is_dir());
+        assert_eq!(
+            repo.submodules()[0].recorded.as_deref(),
+            Some(recorded.as_str())
+        );
+
+        confirm_delete(&mut frames, &mut app);
+        assert!(!folder.exists());
+        let state = app.active().unwrap();
+        assert!(state.status.staged.iter().any(|change| {
+            change.path == path && change.status == imgit_git::FileStatus::Deleted
+        }));
+        assert!(
+            state
+                .status
+                .staged
+                .iter()
+                .any(|change| change.path == ".gitmodules")
+        );
+        assert!(
+            state
+                .status
+                .unstaged
+                .iter()
+                .any(|change| change.path == "unrelated.txt")
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join("unrelated.txt")).unwrap(),
+            "Keep this file\n"
+        );
+        let gitmodules = std::fs::read_to_string(repo.workdir().join(".gitmodules")).unwrap();
+        assert!(!gitmodules.contains(path));
+        let state = app.active_mut().unwrap();
+        state.repo.commit("Remove dependency", false).unwrap();
+        state.refresh();
+        assert!(state.history.submodules.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_config_only_submodule_leaves_its_directory_and_other_entries() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = submodule_repo(scratch.path().join("repo"));
+        repo.commit("Initial revision", false).unwrap();
+        let path = "manual";
+        let folder = repo.workdir().join(path);
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("keep.txt"), "Keep\n").unwrap();
+        let gitmodules = repo.workdir().join(".gitmodules");
+        std::fs::write(&gitmodules,
+            "[submodule \"manual\"]\n\tpath = manual\n\turl = ../missing.git\n[submodule \"other\"]\n\tpath = other\n\turl = ../other.git\n",
+        ).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let submodule = app
+            .active()
+            .unwrap()
+            .history
+            .submodules
+            .iter()
+            .find(|item| item.path == path)
+            .unwrap()
+            .clone();
+        assert_eq!(submodule.recorded, None);
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| ask_to_delete(app, state, &submodule, path))
+            .unwrap();
+        assert!(app.dialog.message.contains("its folder is left as it is"));
+        confirm_delete(&mut frames, &mut app);
+        assert_eq!(
+            std::fs::read_to_string(folder.join("keep.txt")).unwrap(),
+            "Keep\n"
+        );
+        let config = std::fs::read_to_string(gitmodules).unwrap();
+        assert!(!config.contains("manual"));
+        assert!(config.contains("../other.git"));
+        let state = app.active().unwrap();
+        assert_eq!(state.history.submodules.len(), 1);
+        assert_eq!(state.history.submodules[0].path, "other");
+        assert_eq!(state.status.staged[0].path, ".gitmodules");
+    }
+
+    #[test]
+    fn add_submodule_uses_the_url_name_when_path_is_empty_and_reports_git_failure() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = submodule_repo(scratch.path().join("repo"));
+        repo.commit("Initial revision", false).unwrap();
+        let missing = scratch.path().join("missing.git");
+        let url = missing.to_string_lossy().replace('\\', "/");
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        app.dialog.open(DialogKind::AddSubmodule);
+        app.dialog.text_a.clone_from(&url);
+        let mut frames = TestFrames::new();
+        let mut add = Vec2::ZERO;
+        for _ in 0..4 {
+            frames.draw(|cx| {
+                add = cx.cursor() + vec2(61.0, 220.0);
+                render_submodule_panel(cx, &mut app);
+            });
+        }
+        assert!(app.dialog.text_b.is_empty());
+        frames.click_left(add, |cx| render_submodule_panel(cx, &mut app));
+        assert!(!app.dialog.is_open());
+        let operation = app.active().unwrap().async_op.as_ref().unwrap();
+        assert_eq!(
+            operation.args,
+            ["submodule", "add", "--", url.as_str(), "missing"]
+        );
+        finish_submodule_command(&mut app);
+        assert_eq!(
+            app.toasts.history()[0].kind,
+            crate::app::toasts::ToastKind::Error
+        );
+        assert!(!repo.workdir().join("missing").exists());
+        assert!(app.active().unwrap().history.submodules.is_empty());
+    }
+
+    fn submodule_fixture() -> (
+        tempfile::TempDir,
+        imgit_git::Repository,
+        imgit_git::Repository,
+        Application,
+        String,
+        String,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let dependency = submodule_repo(scratch.path().join("dependency"));
+        let parent = submodule_repo(scratch.path().join("app"));
+        let message = format!(
+            "Older revision\n\n{}",
+            "A long description of the past revision.\n".repeat(20)
+        );
+        let old = dependency.commit(&message, false).unwrap();
+        let recorded = dependency.commit("Recorded revision", false).unwrap();
+        let url = dependency.workdir().to_string_lossy().replace('\\', "/");
+        let added = imgit_git::cli::run(
+            parent.workdir(),
+            [
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--",
+                &url,
+                "vendor/lib",
+            ],
+            imgit_git::cli::RunOptions::default(),
+        );
+        assert!(added.success(), "{}", added.text);
+        let parent = imgit_git::Repository::open(parent.workdir()).unwrap();
+        parent.commit("Add dependency", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&parent.workdir().to_string_lossy());
+        (scratch, dependency, parent, app, old, recorded)
+    }
+
+    fn submodule_repo(folder: std::path::PathBuf) -> imgit_git::Repository {
+        let repo = imgit_git::Repository::init(folder).unwrap();
+        repo.set_local_config("user.name", Some("Submodule test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("submodule@example.invalid"))
+            .unwrap();
+        repo
+    }
+
+    fn edit_submodule(app: &mut Application, path: &str, url: &str) {
+        app.dialog.open(DialogKind::EditSubmodule);
+        app.dialog.text_a = url.replace('\\', "/");
+        app.dialog.text_b = path.to_owned();
+    }
+
+    fn render_submodule_panel(cx: &mut Cx<'_>, app: &mut Application) {
+        app.with_active(|app, state| {
+            super::super::draw_slide_panel(cx, app, state, cx.cursor(), 620.0, 680.0);
+        })
+        .unwrap();
+    }
+
+    fn confirm_delete(frames: &mut TestFrames, app: &mut Application) {
+        let confirm = app.dialog.on_confirm.take().unwrap();
+        app.dialog.close();
+        frames.draw(|cx| confirm(cx, app));
+        assert_eq!(
+            app.active().unwrap().async_op.as_ref().unwrap().title,
+            "Delete submodule"
+        );
+        finish_submodule_command(app);
+        assert_ne!(
+            app.toasts.history()[0].kind,
+            crate::app::toasts::ToastKind::Error,
+            "{:?}",
+            app.toasts.history()[0]
+        );
+    }
+
+    fn finish_submodule_command(app: &mut Application) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "submodule command timed out"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn the_folder_name_comes_from_the_url() {

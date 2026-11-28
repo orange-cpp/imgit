@@ -795,6 +795,137 @@ pub fn draw_multi_panel(cx: &mut Cx<'_>, state: &RepoState, size: Vec2) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn the_working_directory_comparison_opens_a_diff_against_the_selected_commit() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Compare test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("compare@example.invalid"))
+            .unwrap();
+        let file = repo.workdir().join("file.txt");
+        std::fs::write(&file, "Before\n").unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let base = repo.commit("Base", false).unwrap();
+        std::fs::write(&file, "After\n").unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let head = repo.commit("Change", false).unwrap();
+        std::fs::write(&file, "Working copy\n").unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            let size = vec2(440.0, 660.0);
+            let draw = |cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState| {
+                super::super::draw_detail_panel(cx, app, state, size);
+            };
+            state.select_only(&head);
+            state.select(&base, true, false);
+            frames.draw(|cx| draw(cx, app, state));
+            assert!(state.compare_sha.is_none());
+
+            state.select_only(&base);
+            state.select(WIP_SHA, true, false);
+            let mut row = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    // The list follows the compare heading, revision and count.
+                    row = cx.cursor() + vec2(85.0, 82.0);
+                    draw(cx, app, state);
+                });
+            }
+            assert_eq!(state.compare_sha.as_deref(), Some(base.as_str()));
+            assert_eq!(state.compare_files.len(), 1);
+            frames.click_left(row, |cx| draw(cx, app, state));
+            let target = state.diff_target.as_ref().unwrap();
+            assert_eq!(target.path, "file.txt");
+            assert_eq!(
+                target.source,
+                imgit_app::repo_state::DiffSource::Compare(base)
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn rewording_then_viewing_all_files_opens_an_unchanged_file_at_the_rewritten_commit() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Detail test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("detail@example.invalid"))
+            .unwrap();
+        for name in ["a-unchanged.txt", "b-edited.txt"] {
+            std::fs::write(repo.workdir().join(name), "Before\n").unwrap();
+            repo.stage(&[name]).unwrap();
+        }
+        let parent = repo.commit("Base", false).unwrap();
+        std::fs::write(repo.workdir().join("b-edited.txt"), "After\n").unwrap();
+        repo.stage(&["b-edited.txt"]).unwrap();
+        let original = repo
+            .commit(
+                "Update\n\nCo-Authored-By: Teammate <team@example.invalid>",
+                false,
+            )
+            .unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.settings.commit_message_height = 150.0;
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.select_only(&original);
+            let size = vec2(440.0, 660.0);
+            let draw = |cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState| {
+                super::super::draw_detail_panel(cx, app, state, size);
+            };
+            let mut origin = Vec2::ZERO;
+            for _ in 0..2 {
+                frames.draw(|cx| {
+                    origin = cx.cursor();
+                    draw(cx, app, state);
+                });
+            }
+            assert_eq!(state.commit_files.len(), 1);
+            assert_eq!(state.commit_files[0].path, "b-edited.txt");
+            frames.click_left(origin + vec2(80.0, 70.0), |cx| draw(cx, app, state));
+            assert!(state.amending_message);
+            for _ in 0..2 {
+                frames.draw(|cx| draw(cx, app, state));
+            }
+            frames.type_text(" revised");
+            frames.draw(|cx| draw(cx, app, state));
+            assert_eq!(state.amend_summary, "Update revised");
+            // Update Message sits just under the 150px message panel.
+            frames.click_left(origin + vec2(100.0, 46.0 + 150.0 + 26.0), |cx| {
+                draw(cx, app, state)
+            });
+            assert!(!state.amending_message);
+            let rewritten = state.single_selected().unwrap();
+            assert_eq!(rewritten.summary, "Update revised");
+            assert_eq!(rewritten.parents, [parent.as_str()]);
+            assert_ne!(rewritten.sha, original);
+            let updated_sha = rewritten.sha.clone();
+
+            let author_top = 46.0 + 150.0;
+            frames.click_left(origin + vec2(size.x - 40.0, author_top + 110.0), |cx| {
+                draw(cx, app, state)
+            });
+            assert!(app.panels.detail_panel.view_all_files);
+            assert_eq!(app.panels.detail_panel.all_files.files.len(), 2);
+            frames.click_left(origin + vec2(90.0, author_top + 145.0), |cx| {
+                draw(cx, app, state)
+            });
+            let history = state.file_history.as_ref().unwrap();
+            assert_eq!(history.path, "a-unchanged.txt");
+            assert_eq!(history.from.as_deref(), Some(updated_sha.as_str()));
+            assert_eq!(history.selected_sha.as_deref(), Some(updated_sha.as_str()));
+        })
+        .unwrap();
+    }
 
     #[test]
     fn finds_co_author_trailers() {

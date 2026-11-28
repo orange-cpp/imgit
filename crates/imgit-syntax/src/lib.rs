@@ -18,6 +18,8 @@ mod diff;
 mod language;
 mod languages;
 mod spans;
+#[cfg(test)]
+mod tests;
 mod token;
 mod tokenizer;
 

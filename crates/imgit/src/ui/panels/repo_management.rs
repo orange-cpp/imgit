@@ -1463,6 +1463,507 @@ mod tests {
     }
 
     #[test]
+    fn starring_an_open_repository_persists_its_favorite() {
+        use crate::shell::test_frame::TestFrames;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("project")).unwrap();
+        let path = repo.workdir().to_string_lossy().into_owned();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&path);
+        app.repo_management_open = true;
+        let mut frames = TestFrames::new();
+        let draw = |frames: &mut TestFrames, app: &mut Application| {
+            let mut star = Vec2::default();
+            frames.draw(|cx| {
+                // Left margin, first section header, then its first repository row.
+                star = cx.cursor() + vec2(45.0 + 18.75, 144.0 + 44.0 + 15.0 + 17.0);
+                draw_repo_management(cx, app, vec2(1180.0, 700.0));
+            });
+            star
+        };
+
+        draw(&mut frames, &mut app);
+        let click_at = draw(&mut frames, &mut app);
+        assert!(load_favorites(&app).is_empty());
+        frames.move_mouse(click_at.into());
+        draw(&mut frames, &mut app);
+        frames.set_left_mouse(true);
+        draw(&mut frames, &mut app);
+        frames.set_left_mouse(false);
+        draw(&mut frames, &mut app);
+        assert_eq!(favorite_repositories(&app), [path.as_str()]);
+        assert_eq!(load_favorites(&app), BTreeSet::from([path]));
+        assert!(app.repo_management_open);
+    }
+
+    #[test]
+    fn repository_management_filters_by_alias_and_opens_the_matching_tab() {
+        use crate::shell::test_frame::TestFrames;
+        use imgit_git::Repository;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let wanted = Repository::init(scratch.path().join("alpha")).unwrap();
+        let current = Repository::init(scratch.path().join("beta")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&wanted.workdir().to_string_lossy());
+        app.open_repository(&current.workdir().to_string_lossy());
+        app.set_repo_alias(wanted.workdir(), "Review candidate");
+        app.repo_management_open = true;
+
+        let size = vec2(1180.0, 700.0);
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        let mut expand = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                let collapse_width =
+                    25.0 + cx.text_size(cx.fonts.regular, 14.0, "Collapse").x + 8.0;
+                expand = origin + vec2(45.0 + collapse_width + 4.0 + 16.0, 106.0);
+                draw_repo_management(cx, &mut app, size);
+            });
+        }
+        frames.click_left(origin + vec2(62.0, 106.0), |cx| {
+            draw_repo_management(cx, &mut app, size)
+        });
+        assert_eq!(
+            app.panels.repo_management.collapsed.len(),
+            Section::ALL.len()
+        );
+        frames.click_left(expand, |cx| draw_repo_management(cx, &mut app, size));
+        assert!(app.panels.repo_management.collapsed.is_empty());
+        frames.click_left(origin + vec2(size.x - 57.0, 106.0), |cx| {
+            draw_repo_management(cx, &mut app, size)
+        });
+        assert!(!app.panels.repo_management.wip_summary);
+
+        frames.click_left(origin + vec2(300.0, 106.0), |cx| {
+            draw_repo_management(cx, &mut app, size)
+        });
+        frames.type_text("candidate");
+        frames.draw(|cx| draw_repo_management(cx, &mut app, size));
+        assert_eq!(app.panels.repo_management.search, "candidate");
+        assert_eq!(app.active_workdir(), Some(current.workdir()));
+        // The matching entry is now the first row of the Open section.
+        frames.click_left(origin + vec2(161.0, 220.0), |cx| {
+            draw_repo_management(cx, &mut app, size)
+        });
+        assert_eq!(app.active_workdir(), Some(wanted.workdir()));
+        assert!(!app.repo_management_open);
+        assert_eq!(app.tabs.len(), 2);
+    }
+
+    #[test]
+    fn a_repository_batch_runs_each_path_once_and_reports_partial_failure() {
+        use crate::shell::test_frame::TestFrames;
+        use imgit_git::Repository;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let first = Repository::init(scratch.path().join("first")).unwrap();
+        let second = Repository::init(scratch.path().join("second")).unwrap();
+        let not_a_repo = scratch.path().join("invalid");
+        fs::create_dir_all(&not_a_repo).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let valid = vec![
+            first.workdir().to_string_lossy().into_owned(),
+            second.workdir().to_string_lossy().into_owned(),
+        ];
+        let mut mixed = valid.clone();
+        mixed.push(not_a_repo.to_string_lossy().into_owned());
+        let mut frames = TestFrames::new();
+        let fetch = |frames: &mut TestFrames, app: &mut Application, paths: &[String]| {
+            frames.draw(|cx| {
+                let mut item = section_menu(Section::Recent, paths, false, false)
+                    .into_iter()
+                    .find(|item| item.label == "Fetch all")
+                    .unwrap();
+                assert!(item.enabled);
+                item.click.take().unwrap()(cx, app);
+            });
+        };
+        let finish = |app: &mut Application| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while app.background_running("repositories:Fetch all") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fetch batch did not finish"
+                );
+                app.poll_background();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        fetch(&mut frames, &mut app, &mixed);
+        assert!(app.background_running("repositories:Fetch all"));
+        fetch(&mut frames, &mut app, &mixed);
+        assert_eq!(
+            app.toasts.history()[0].title,
+            "Fetch all is already running"
+        );
+        finish(&mut app);
+        assert_eq!(app.toasts.history()[0].title, "Fetch all failed in 1 of 3");
+        assert_eq!(app.toasts.history()[0].detail, "invalid");
+
+        fetch(&mut frames, &mut app, &valid);
+        finish(&mut app);
+        assert_eq!(app.toasts.history()[0].title, "Fetch all: 2 repositories");
+        assert_eq!(app.toasts.history()[0].kind, ToastKind::Success);
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn row_removals_affect_only_the_open_favorite_or_recent_section() {
+        use crate::shell::test_frame::TestFrames;
+        use crate::ui::menu::{draw_menus, menu_open};
+        use imgit_git::Repository;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let first = Repository::init(scratch.path().join("first")).unwrap();
+        let second = Repository::init(scratch.path().join("second")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&first.workdir().to_string_lossy());
+        app.open_repository(&second.workdir().to_string_lossy());
+        app.repo_management_open = true;
+        let favorites_file = app.config_path("favorites.txt");
+        app.panels.repo_management.set_favorite(
+            &favorites_file,
+            &first.workdir().to_string_lossy(),
+            true,
+        );
+
+        let size = vec2(1180.0, 700.0);
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw_repo_management(cx, &mut app, size);
+            });
+        }
+        let right = size.x - 45.0;
+        let row_action = |header_y: f32| origin + vec2(right - 35.0, header_y + 44.0 + 15.0 + 17.0);
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            draw_repo_management(cx, app, size);
+            draw_menus(cx, app);
+        };
+
+        let open_top = 144.0;
+        frames.click_left(row_action(open_top), |cx| draw(cx, &mut app));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_workdir(), Some(second.workdir()));
+        assert_eq!(app.recent_repos, [second.workdir(), first.workdir()]);
+        assert_eq!(
+            load_favorites(&app),
+            BTreeSet::from([first.workdir().to_string_lossy().into_owned()])
+        );
+
+        let one_row_section = 44.0 + 15.0 + 34.0 + 18.0;
+        let empty_section = 44.0 + 64.0;
+        let favorites_top = open_top + one_row_section;
+        frames.click_left(row_action(favorites_top), |cx| draw(cx, &mut app));
+        assert!(load_favorites(&app).is_empty());
+        assert!(favorite_repositories(&app).is_empty());
+        assert_eq!(app.recent_repos, [second.workdir(), first.workdir()]);
+
+        let recent_top = favorites_top + empty_section;
+        frames.click_left(row_action(recent_top), |cx| draw(cx, &mut app));
+        app.load_recent();
+        assert_eq!(app.recent_repos, [first.workdir()]);
+        assert_eq!(app.active_workdir(), Some(second.workdir()));
+
+        let mut opened = false;
+        frames.click_left(row_action(recent_top + one_row_section), |cx| {
+            draw(cx, &mut app);
+            opened = menu_open(cx);
+        });
+        assert!(opened, "the All repositories row should open its More menu");
+        assert!(app.repo_management_open);
+    }
+
+    #[test]
+    fn repository_menus_open_tabs_and_persist_removal_actions() {
+        use crate::shell::test_frame::TestFrames;
+        use imgit_git::Repository;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let first = Repository::init(scratch.path().join("first")).unwrap();
+        let second = Repository::init(scratch.path().join("second")).unwrap();
+        let paths = vec![
+            first.workdir().to_string_lossy().into_owned(),
+            second.workdir().to_string_lossy().into_owned(),
+        ];
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let mut frames = TestFrames::new();
+        let empty = section_menu(Section::Favorites, &[], false, false);
+        for label in [
+            "Open all in tabs",
+            "Fetch all",
+            "Pull all (rebase)",
+            "Remove all favorites",
+        ] {
+            assert!(
+                !empty
+                    .iter()
+                    .find(|item| item.label == label)
+                    .unwrap()
+                    .enabled,
+                "{label}"
+            );
+        }
+
+        app.repo_management_open = true;
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            section_menu(Section::Recent, &paths, false, false),
+            "Open all in tabs",
+        );
+        assert!(!app.repo_management_open);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_workdir(), Some(second.workdir()));
+
+        let first_path = &paths[0];
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            row_menu(first_path, false, true),
+            "Add to favorites",
+        );
+        assert_eq!(load_favorites(&app), BTreeSet::from([first_path.clone()]));
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            row_menu(first_path, true, true),
+            "Remove from favorites",
+        );
+        assert!(load_favorites(&app).is_empty());
+        for path in &paths {
+            select_menu_item(
+                &mut frames,
+                &mut app,
+                row_menu(path, false, true),
+                "Add to favorites",
+            );
+        }
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            section_menu(Section::Favorites, &paths, false, true),
+            "Collapse section",
+        );
+        assert!(
+            app.panels
+                .repo_management
+                .collapsed
+                .contains(&Section::Favorites)
+        );
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            section_menu(Section::Favorites, &paths, true, true),
+            "Expand section",
+        );
+        assert!(
+            !app.panels
+                .repo_management
+                .collapsed
+                .contains(&Section::Favorites)
+        );
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            section_menu(Section::Favorites, &paths, false, true),
+            "Remove all favorites",
+        );
+        assert!(load_favorites(&app).is_empty());
+
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            row_menu(first_path, false, true),
+            "Remove from recent",
+        );
+        app.load_recent();
+        assert_eq!(app.recent_repos, [second.workdir()]);
+        assert_eq!(app.tabs.len(), 2);
+
+        app.repo_management_open = true;
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            row_menu(first_path, false, false),
+            "Open repository",
+        );
+        assert!(!app.repo_management_open);
+        assert_eq!(app.active_workdir(), Some(first.workdir()));
+        assert_eq!(app.tabs.len(), 2);
+    }
+
+    #[test]
+    fn batch_pull_can_fast_forward_then_rebase_a_diverged_repository() {
+        use crate::shell::test_frame::TestFrames;
+        use std::time::{Duration, Instant};
+
+        let scratch = tempfile::tempdir().unwrap();
+        let upstream = scratch.path().join("upstream");
+        let first = scratch.path().join("first");
+        let second = scratch.path().join("second");
+        let git = |dir: &Path, args: &[&str]| {
+            let output = cli::run(dir, args, RunOptions::default());
+            assert!(output.success(), "git {args:?}: {}", output.text);
+            output.text
+        };
+        git(
+            scratch.path(),
+            &["init", "-b", "main", &upstream.to_string_lossy()],
+        );
+        let commit = |dir: &Path, path: &str, contents: &str, message: &str| {
+            fs::write(dir.join(path), contents).unwrap();
+            git(dir, &["add", "--", path]);
+            git(dir, &["commit", "-m", message]);
+        };
+        let configure = |dir: &Path| {
+            for (key, value) in [
+                ("user.name", "Batch pull test"),
+                ("user.email", "batch@example.invalid"),
+                ("commit.gpgSign", "false"),
+                ("core.autocrlf", "false"),
+            ] {
+                git(dir, &["config", "--local", key, value]);
+            }
+        };
+        configure(&upstream);
+        commit(&upstream, "shared.txt", "initial\n", "Base");
+        for dir in [&first, &second] {
+            git(
+                scratch.path(),
+                &[
+                    "clone",
+                    "--config",
+                    "core.autocrlf=false",
+                    "--",
+                    &upstream.to_string_lossy(),
+                    &dir.to_string_lossy(),
+                ],
+            );
+            configure(dir);
+            assert!(git(dir, &["status", "--porcelain"]).is_empty());
+        }
+        commit(&second, "local.txt", "local work\n", "Local work");
+        let original_local = git(&second, &["rev-parse", "HEAD"]);
+        commit(&upstream, "shared.txt", "upstream\n", "Upstream work");
+        let upstream_tip = git(&upstream, &["rev-parse", "HEAD"]);
+
+        let paths = [&first, &second].map(|dir| dir.to_string_lossy().into_owned());
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let mut frames = TestFrames::new();
+        let finish = |app: &mut Application, title: &str| {
+            let tag = format!("repositories:{title}");
+            assert!(app.background_running(&tag));
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while app.background_running(&tag) {
+                assert!(Instant::now() < deadline, "{title} timed out");
+                app.poll_background();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            section_menu(Section::Recent, &paths, false, false),
+            "Pull all (fast-forward only)",
+        );
+        finish(&mut app, "Pull all");
+        let result = &app.toasts.history()[0];
+        assert_eq!(result.kind, ToastKind::Error);
+        assert_eq!(result.detail, "second");
+        assert_eq!(git(&first, &["rev-parse", "HEAD"]), upstream_tip);
+        assert_eq!(git(&second, &["rev-parse", "HEAD"]), original_local);
+
+        select_menu_item(
+            &mut frames,
+            &mut app,
+            section_menu(Section::Recent, &paths, false, false),
+            "Pull all (rebase)",
+        );
+        finish(&mut app, "Pull all (rebase)");
+        assert_eq!(app.toasts.history()[0].kind, ToastKind::Success);
+        assert_eq!(
+            app.toasts.history()[0].title,
+            "Pull all (rebase): 2 repositories"
+        );
+        assert_eq!(git(&second, &["rev-parse", "HEAD^"]), upstream_tip);
+        assert_ne!(git(&second, &["rev-parse", "HEAD"]), original_local);
+        assert_eq!(
+            fs::read_to_string(second.join("local.txt")).unwrap(),
+            "local work\n"
+        );
+        assert_eq!(
+            fs::read_to_string(second.join("shared.txt")).unwrap(),
+            "upstream\n"
+        );
+        assert!(git(&second, &["status", "--porcelain"]).is_empty());
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn summary_pills_draw_tracking_counts_and_optionally_draw_working_changes() {
+        use crate::shell::test_frame::TestFrames;
+
+        let mut frames = TestFrames::new();
+        let summary = RepoSummary {
+            branch: Some("topic".to_owned()),
+            ahead: 2,
+            behind: 3,
+            modified: 4,
+            added: 0,
+            deleted: 1,
+            ..RepoSummary::default()
+        };
+        frames.draw(|cx| {
+            let draw = cx.window_draw_list();
+            let origin = cx.cursor();
+            let mut rendered = |summary: &RepoSummary, wip| {
+                let start = draw.vertex_count();
+                draw_pills(cx, draw, summary, wip, origin.x, origin.y + 40.0);
+                draw.vertex_count() - start
+            };
+            assert_eq!(rendered(&RepoSummary::default(), true), 0);
+            assert_eq!(
+                rendered(
+                    &RepoSummary {
+                        branch: Some(String::new()),
+                        ..RepoSummary::default()
+                    },
+                    true
+                ),
+                0
+            );
+            let branch_only = RepoSummary {
+                branch: summary.branch.clone(),
+                ..RepoSummary::default()
+            };
+            let branch_vertices = rendered(&branch_only, true);
+            let tracking_vertices = rendered(&summary, false);
+            assert!(branch_vertices > 0);
+            assert!(tracking_vertices > branch_vertices);
+            assert!(rendered(&summary, true) > tracking_vertices);
+        });
+    }
+
+    fn select_menu_item(
+        frames: &mut crate::shell::test_frame::TestFrames,
+        app: &mut Application,
+        items: MenuItems,
+        label: &str,
+    ) {
+        let item = items.into_iter().find(|item| item.label == label).unwrap();
+        assert!(item.enabled, "{label}");
+        frames.draw(|cx| item.click.unwrap()(cx, app));
+    }
+
+    #[test]
     fn paths_are_normalized_and_named() {
         assert_eq!(normalized("C:\\work\\repo\\"), "C:/work/repo");
         assert_eq!(normalized("/a/b//"), "/a/b");

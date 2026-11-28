@@ -27,12 +27,13 @@ use glutin::surface::{
 #[cfg(not(windows))]
 use glutin_winit::DisplayBuilder;
 use glutin_winit::GlWindow as _;
+use imgit_platform::shell::DialogParent;
 use raw_window_handle::HasWindowHandle as _;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Fullscreen, Icon, Theme, Window, WindowId};
+use winit::window::{Fullscreen, Icon, Theme, UserAttentionType, Window, WindowId};
 
 use crate::dev::{
     DEV_COMMAND_FRAME, DevCommand, DevOptions, SCREENSHOT_FRAME, SCREENSHOT_MAX_WAIT_FRAMES,
@@ -91,14 +92,30 @@ struct FrameRequests {
     background: Option<[f32; 4]>,
 }
 
+/// The native window services used by UI frames.
+pub trait FrameWindow: DialogParent {
+    fn has_focus(&self) -> bool;
+    fn request_user_attention(&self, request: Option<UserAttentionType>);
+}
+
+impl FrameWindow for Window {
+    fn has_focus(&self) -> bool {
+        Window::has_focus(self)
+    }
+
+    fn request_user_attention(&self, request: Option<UserAttentionType>) {
+        Window::request_user_attention(self, request);
+    }
+}
+
 /// The shell as a frame sees it.
 pub struct ShellContext<'a> {
     /// The loaded fonts.
     pub fonts: &'a Fonts,
     /// Creates and destroys the UI's own textures.
     pub textures: &'a mut dyn Textures,
-    /// The main window: the parent of system dialogs (`raw_window_handle::HasWindowHandle`).
-    pub window: &'a Window,
+    /// The main window: the parent of system dialogs and the source of its focus state.
+    pub window: &'a dyn FrameWindow,
     /// The command line.
     pub options: &'a DevOptions,
     /// Frames drawn so far.
@@ -452,7 +469,7 @@ impl<F: Frame> State<F> {
         let frame = create(&mut ShellContext {
             fonts: &fonts,
             textures: &mut renderer,
-            window: &window,
+            window: window.as_ref(),
             options,
             frame_index: 0,
             title_bar_inset: chrome.title_bar_inset(),
@@ -570,7 +587,7 @@ impl<F: Frame> State<F> {
             let mut shell = ShellContext {
                 fonts: &self.fonts,
                 textures: &mut self.renderer,
-                window: &self.window,
+                window: self.window.as_ref(),
                 options,
                 frame_index: self.frame_index,
                 title_bar_inset: self.chrome.title_bar_inset(),
@@ -879,6 +896,12 @@ fn create_gl(
         unsafe { glow::Context::from_loader_function_cstr(|name| display.get_proc_address(name)) };
     Ok((context, surface, Rc::new(gl)))
 }
+
+#[cfg(all(test, windows, feature = "lcd-text"))]
+mod renderer_tests;
+
+#[cfg(test)]
+pub(crate) mod test_frame;
 
 #[cfg(test)]
 mod input_tests {

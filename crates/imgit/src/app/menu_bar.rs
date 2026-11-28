@@ -290,3 +290,191 @@ fn help_menu(cx: &Cx<'_>) -> MenuItems {
         ],
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imgit_git::Repository;
+
+    use crate::shell::test_frame::TestFrames;
+    use crate::ui::menu::strip_mnemonic;
+
+    fn action(cx: &Cx<'_>, index: usize, path: &[&str]) -> crate::app::action::Action {
+        let mut items = bar_menu(cx, index);
+        for (depth, label) in path.iter().enumerate() {
+            let item = items
+                .into_iter()
+                .find(|item| strip_mnemonic(&item.label) == *label)
+                .unwrap_or_else(|| panic!("missing menu item {label:?}"));
+            assert!(item.enabled, "{label:?} is disabled");
+            if depth + 1 == path.len() {
+                return item.click.unwrap();
+            }
+            items = item.submenu;
+        }
+        panic!("no menu item was requested");
+    }
+
+    fn choose(frames: &mut TestFrames, app: &mut Application, index: usize, path: &[&str]) {
+        frames.draw(|cx| action(cx, index, path)(cx, app));
+    }
+
+    #[test]
+    fn file_and_help_actions_find_the_current_tab_and_open_the_requested_view() {
+        let scratch = tempfile::tempdir().unwrap();
+        let first = Repository::init(scratch.path().join("first")).unwrap();
+        let second = Repository::init(scratch.path().join("second")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        for repo in [&first, &second] {
+            app.open_repository(&repo.workdir().to_string_lossy());
+        }
+        let mut frames = TestFrames::new();
+        let mut close = None;
+        frames.draw(|cx| close = Some(action(cx, 0, &["Close Tab"])));
+        // The menu can stay open while another repository becomes active.
+        app.active_tab = Some(0);
+        frames.draw(|cx| close.take().unwrap()(cx, &mut app));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_workdir(), Some(second.workdir()));
+        choose(&mut frames, &mut app, 0, &["Reopen Closed Tab"]);
+        assert_eq!(app.active_workdir(), Some(first.workdir()));
+        assert_eq!(app.tabs.len(), 2);
+
+        choose(&mut frames, &mut app, 0, &["Open Repo Management"]);
+        assert!(app.repo_management_open);
+        choose(&mut frames, &mut app, 0, &["Preferences..."]);
+        assert!(app.preferences_open);
+        choose(&mut frames, &mut app, 0, &["Init Repo..."]);
+        assert!(app.dialog.is(DialogKind::InitRepo));
+        choose(&mut frames, &mut app, 0, &["Clone Repo..."]);
+        assert!(app.dialog.is(DialogKind::CloneRepo));
+        choose(&mut frames, &mut app, 3, &["Keyboard Shortcuts"]);
+        assert!(app.dialog.is(DialogKind::KeyboardShortcuts));
+        choose(&mut frames, &mut app, 3, &["Open Command Palette"]);
+        assert!(app.fuzzy.open);
+        choose(&mut frames, &mut app, 0, &["New Tab"]);
+        assert!(app.active_tab.is_none());
+    }
+
+    #[test]
+    fn view_menu_routes_zoom_and_tab_actions_to_the_appropriate_state() {
+        let scratch = tempfile::tempdir().unwrap();
+        let first = Repository::init(scratch.path().join("first")).unwrap();
+        let second = Repository::init(scratch.path().join("second")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&first.workdir().to_string_lossy());
+        app.open_repository(&second.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+
+        choose(&mut frames, &mut app, 2, &["Tabs", "Select Next Tab"]);
+        assert_eq!(app.active_workdir(), Some(first.workdir()));
+        choose(&mut frames, &mut app, 2, &["Tabs", "Select Previous Tab"]);
+        assert_eq!(app.active_workdir(), Some(second.workdir()));
+        choose(&mut frames, &mut app, 2, &["Tabs", "Select Tab 1"]);
+        assert_eq!(app.active_workdir(), Some(first.workdir()));
+        choose(&mut frames, &mut app, 2, &["Tabs", "Select Tab 3"]);
+        assert_eq!(app.active_workdir(), Some(first.workdir()));
+        choose(&mut frames, &mut app, 2, &["Tabs", "Open Tabs List"]);
+        assert!(app.tabs_list_requested);
+
+        for _ in 0..2 {
+            choose(
+                &mut frames,
+                &mut app,
+                2,
+                &["Terminal Tabs", "New Terminal Tab"],
+            );
+        }
+        assert_eq!(app.terminal_tabs(Some(first.workdir())).active, 1);
+        assert!(
+            app.terminal_tabs(Some(second.workdir()))
+                .sessions
+                .is_empty()
+        );
+        app.show_terminal_panel = false;
+        app.terminal.minimized = true;
+        app.terminal.focus_requested = false;
+        choose(
+            &mut frames,
+            &mut app,
+            2,
+            &["Terminal Tabs", "Select Next Terminal Tab"],
+        );
+        assert_eq!(app.terminal_tabs(Some(first.workdir())).active, 0);
+        assert!(app.show_terminal_panel && app.terminal.focus_requested && !app.terminal.minimized);
+        choose(
+            &mut frames,
+            &mut app,
+            2,
+            &["Terminal Tabs", "Select Previous Terminal Tab"],
+        );
+        assert_eq!(app.terminal_tabs(Some(first.workdir())).active, 1);
+        choose(
+            &mut frames,
+            &mut app,
+            2,
+            &["Terminal Tabs", "Select Terminal Tab 1"],
+        );
+        assert_eq!(app.terminal_tabs(Some(first.workdir())).active, 0);
+        choose(
+            &mut frames,
+            &mut app,
+            2,
+            &["Terminal Tabs", "Select Terminal Tab 3"],
+        );
+        assert_eq!(app.terminal_tabs(Some(first.workdir())).active, 0);
+        choose(
+            &mut frames,
+            &mut app,
+            2,
+            &["Terminal Tabs", "Close Terminal Tab"],
+        );
+        assert_eq!(app.terminal_tabs(Some(first.workdir())).sessions.len(), 1);
+
+        app.settings.zoom = 1.95;
+        choose(&mut frames, &mut app, 2, &["Increase Zoom"]);
+        assert_eq!(app.settings.zoom, 2.0);
+        choose(&mut frames, &mut app, 2, &["Decrease Zoom"]);
+        assert_eq!(app.settings.zoom, 1.9);
+        choose(&mut frames, &mut app, 2, &["Reset Zoom"]);
+        frames.draw(|cx| assert_eq!(cx.state.zoom(), 1.0));
+        let mut saved = crate::app::settings::Settings::default();
+        saved.load(&app.config_path("settings.txt"));
+        assert_eq!(saved.zoom, 1.0);
+
+        choose(&mut frames, &mut app, 2, &["Show Left Panel"]);
+        choose(&mut frames, &mut app, 2, &["Show Commit Details Panel"]);
+        choose(&mut frames, &mut app, 2, &["Show Terminal Panel"]);
+        assert!(!app.show_left_panel && !app.show_detail_panel && !app.show_terminal_panel);
+    }
+
+    #[test]
+    fn select_all_from_edit_menu_reaches_the_focused_text_field() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let mut text = "Original text".to_owned();
+        let mut frames = TestFrames::new();
+        for frame in 0..3 {
+            frames.draw(|cx| {
+                if frame == 0 {
+                    cx.ui.set_keyboard_focus_here();
+                }
+                cx.ui.input_text("Example", &mut text).build();
+            });
+        }
+        frames.draw(|cx| {
+            cx.ui.input_text("Example", &mut text).build();
+            action(cx, 1, &["Select All"])(cx, &mut app);
+        });
+        for _ in 0..3 {
+            frames.draw(|cx| {
+                cx.ui.input_text("Example", &mut text).build();
+            });
+        }
+        frames.type_text("Replacement");
+        frames.draw(|cx| {
+            cx.ui.input_text("Example", &mut text).build();
+        });
+        assert_eq!(text, "Replacement");
+    }
+}

@@ -845,6 +845,364 @@ fn set_upstream(cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    fn dialog_key(frames: &mut TestFrames, app: &mut Application, key: Key) {
+        frames.set_key(key, true);
+        frames.draw(|cx| super::super::draw_dialogs(cx, app));
+        frames.set_key(key, false);
+        frames.draw(|cx| super::super::draw_dialogs(cx, app));
+    }
+
+    fn draw_open_dialog(frames: &mut TestFrames, app: &mut Application) {
+        for _ in 0..3 {
+            frames.draw(|cx| super::super::draw_dialogs(cx, app));
+        }
+    }
+
+    fn local_repository(scratch: &Path) -> (Repository, Sha) {
+        let repo = Repository::init(scratch.join("source")).unwrap();
+        repo.set_local_config("user.name", Some("Dialog test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("dialog@example.invalid"))
+            .unwrap();
+        let file = repo.workdir().join("file.txt");
+        std::fs::write(file, "Content\n").unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let head = repo.commit("Initial file", false).unwrap();
+        (repo, head)
+    }
+
+    #[test]
+    fn init_reports_an_invalid_destination_and_opens_the_created_repository() {
+        let scratch = tempfile::tempdir().unwrap();
+        let invalid = scratch.path().join("existing-file");
+        std::fs::write(&invalid, "keep").unwrap();
+        let valid = scratch.path().join("new-repository");
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.dialog.open(DialogKind::InitRepo);
+        app.dialog.text_a = invalid.to_string_lossy().into_owned();
+        let mut frames = TestFrames::new();
+        draw_open_dialog(&mut frames, &mut app);
+        dialog_key(&mut frames, &mut app, Key::Enter);
+        assert!(app.dialog.is(DialogKind::InitRepo));
+        assert!(app.dialog.error.is_some());
+        assert!(app.tabs.is_empty());
+        assert_eq!(std::fs::read_to_string(invalid).unwrap(), "keep");
+
+        app.dialog.text_a = valid.to_string_lossy().into_owned();
+        dialog_key(&mut frames, &mut app, Key::Enter);
+        assert!(!app.dialog.is_open());
+        assert_eq!(
+            app.active_workdir(),
+            Some(Repository::open(&valid).unwrap().workdir())
+        );
+        assert!(app.active().unwrap().history.unborn);
+    }
+
+    #[test]
+    fn cloning_a_local_repository_shows_progress_and_opens_the_clone() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (source, head) = local_repository(scratch.path());
+        let parent = scratch.path().join("clones");
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.dialog.open(DialogKind::CloneRepo);
+        app.dialog.text_a = source.workdir().to_string_lossy().into_owned();
+        app.dialog.text_b = parent.to_string_lossy().into_owned();
+        let mut frames = TestFrames::new();
+        draw_open_dialog(&mut frames, &mut app);
+        dialog_key(&mut frames, &mut app, Key::Enter);
+        let clone = app.pending_clone.as_ref().unwrap();
+        assert_eq!(Path::new(&clone.destination), parent.join("source"));
+        assert!(
+            app.dialog.flag,
+            "the dialog should have drawn the in-progress clone"
+        );
+        assert!(app.tabs.is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.pending_clone.is_some() {
+            assert!(std::time::Instant::now() < deadline, "clone did not finish");
+            app.poll_clone();
+            frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let destination = Repository::open(parent.join("source")).unwrap();
+        assert_eq!(app.active_workdir(), Some(destination.workdir()));
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(head.as_str())
+        );
+        assert!(destination.workdir().join("file.txt").is_file());
+        assert!(!app.dialog.is_open());
+        assert_eq!(app.toasts.history()[0].title, "Clone complete");
+    }
+
+    #[test]
+    fn creating_a_worktree_prefills_its_folder_and_checks_out_the_requested_branch() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (repo, head) = local_repository(scratch.path());
+        repo.create_branch("topic", &head, false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let original = app.active().unwrap().history.head_branch.clone();
+        app.dialog.open(DialogKind::CreateWorktree);
+        app.dialog.ref_name = "topic".to_owned();
+        app.dialog.sha.clone_from(&head);
+
+        let mut frames = TestFrames::new();
+        draw_open_dialog(&mut frames, &mut app);
+        let wanted = default_worktree_folder(repo.workdir(), "topic").unwrap();
+        assert_eq!(Path::new(&app.dialog.text_a), wanted);
+        dialog_key(&mut frames, &mut app, Key::Enter);
+        assert!(!app.dialog.is_open());
+        assert_eq!(
+            app.active().unwrap().async_op.as_ref().unwrap().title,
+            "Create worktree"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree creation did not finish"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let worktree = Repository::open(&wanted)
+            .unwrap()
+            .load_history(&Default::default())
+            .unwrap();
+        assert_eq!(worktree.head_branch.as_deref(), Some("topic"));
+        assert_eq!(worktree.head_sha.as_deref(), Some(head.as_str()));
+        let original_history = repo.load_history(&Default::default()).unwrap();
+        assert_eq!(original_history.head_branch, original);
+        assert!(
+            original_history
+                .worktrees
+                .iter()
+                .any(|entry| Path::new(&entry.path) == wanted)
+        );
+    }
+
+    #[test]
+    fn clearing_the_upstream_in_the_modal_updates_the_branch_configuration() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (repo, head) = local_repository(scratch.path());
+        let history = repo.load_history(&Default::default()).unwrap();
+        let branch = history.head_branch.unwrap();
+        repo.add_remote("origin", ".").unwrap();
+        let output = imgit_git::cli::run(
+            repo.workdir(),
+            ["update-ref", "refs/remotes/origin/topic", &head],
+            imgit_git::cli::RunOptions::default(),
+        );
+        assert!(output.success(), "{}", output.text);
+        repo.set_upstream(&branch, Some("origin/topic")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        assert_eq!(
+            app.active()
+                .unwrap()
+                .head_ref()
+                .unwrap()
+                .upstream
+                .as_deref(),
+            Some("origin/topic")
+        );
+        app.dialog.open(DialogKind::SetUpstream);
+        app.dialog.ref_name.clone_from(&branch);
+
+        let mut frames = TestFrames::new();
+        draw_open_dialog(&mut frames, &mut app);
+        dialog_key(&mut frames, &mut app, Key::Enter);
+        assert!(!app.dialog.is_open());
+        assert!(app.active().unwrap().head_ref().unwrap().upstream.is_none());
+        assert!(
+            repo.config_string(&format!("branch.{branch}.remote"))
+                .is_none()
+        );
+        assert_eq!(app.toasts.history()[0].title, "Upstream cleared");
+    }
+
+    fn confirm_modal(frames: &mut TestFrames, app: &mut Application, kind: DialogKind) {
+        let name = std::ffi::CString::new(title(kind)).unwrap();
+        let mut button = crate::ui::Vec2::ZERO;
+        for _ in 0..3 {
+            frames.draw(|cx| {
+                super::super::draw_dialogs(cx, app);
+                button = crate::shell::test_frame::window_rect(cx, &name).max - vec2(55.0, 30.0);
+            });
+        }
+        frames.click_left(button, |cx| super::super::draw_dialogs(cx, app));
+        assert!(!app.dialog.is_open());
+    }
+
+    #[test]
+    fn editing_an_older_message_in_the_modal_rewrites_the_chain_and_keeps_file_contents() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (repo, base) = local_repository(scratch.path());
+        std::fs::write(repo.workdir().join("second.txt"), "Second file\n").unwrap();
+        repo.stage(&["second.txt"]).unwrap();
+        let edited = repo.commit("Old message", false).unwrap();
+        std::fs::write(repo.workdir().join("third.txt"), "Third file\n").unwrap();
+        repo.stage(&["third.txt"]).unwrap();
+        let old_head = repo.commit("Tip", false).unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        app.dialog.open(DialogKind::RewordCommit);
+        app.dialog.sha = edited;
+        app.dialog.text_a = "Revised message".to_owned();
+        let mut frames = TestFrames::new();
+        confirm_modal(&mut frames, &mut app, DialogKind::RewordCommit);
+        let state = app.active().unwrap();
+        let subjects: Vec<_> = state
+            .commits_above(Some(&base), None)
+            .iter()
+            .map(|commit| commit.summary.as_str())
+            .collect();
+        assert_eq!(subjects, ["Revised message", "Tip"]);
+        assert!(state.status.is_empty());
+        assert_ne!(state.history.head_sha.as_deref(), Some(old_head.as_str()));
+        assert!(repo.workdir().join("second.txt").is_file());
+        assert!(repo.workdir().join("third.txt").is_file());
+
+        app.with_active(|app, state| app.undo(state)).unwrap();
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(old_head.as_str())
+        );
+    }
+
+    #[test]
+    fn squashing_from_the_modal_preserves_both_commits_files_and_can_be_undone() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (repo, base) = local_repository(scratch.path());
+        std::fs::write(repo.workdir().join("a.txt"), "A\n").unwrap();
+        repo.stage(&["a.txt"]).unwrap();
+        let first = repo.commit("First", false).unwrap();
+        std::fs::write(repo.workdir().join("b.txt"), "B\n").unwrap();
+        repo.stage(&["b.txt"]).unwrap();
+        let second = repo.commit("Second", false).unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        app.dialog.open(DialogKind::SquashCommits);
+        app.dialog.shas = vec![first, second.clone()];
+        app.dialog.text_a = "Both files".to_owned();
+        let mut frames = TestFrames::new();
+        confirm_modal(&mut frames, &mut app, DialogKind::SquashCommits);
+
+        let state = app.active().unwrap();
+        let commits = state.commits_above(Some(&base), None);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].summary, "Both files");
+        assert_eq!(
+            repo.commit_tree_paths(&commits[0].sha).unwrap(),
+            ["a.txt", "b.txt", "file.txt"]
+        );
+        assert!(state.status.is_empty());
+
+        app.with_active(|app, state| app.undo(state)).unwrap();
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(second.as_str())
+        );
+    }
+
+    #[test]
+    fn an_annotated_tag_requires_a_message_and_targets_the_dialogs_repository() {
+        let scratch = tempfile::tempdir().unwrap();
+        let target = imgit_git::Repository::init(scratch.path().join("target")).unwrap();
+        let other = imgit_git::Repository::init(scratch.path().join("other")).unwrap();
+        target
+            .set_local_config("user.name", Some("Modal test"))
+            .unwrap();
+        target
+            .set_local_config("user.email", Some("modal@example.invalid"))
+            .unwrap();
+        let sha = target.commit("Base", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&target.workdir().to_string_lossy());
+        app.open_repository(&other.workdir().to_string_lossy());
+        app.dialog.open(DialogKind::CreateTag);
+        app.dialog.workdir = Some(target.workdir().to_owned());
+        app.dialog.sha.clone_from(&sha);
+        app.dialog.flag = true;
+        let mut frames = TestFrames::new();
+        for _ in 0..3 {
+            frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+        }
+        frames.type_text("release");
+        frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+        assert!(app.dialog.is(DialogKind::CreateTag));
+        assert_eq!(app.dialog.text_a, "release");
+        assert!(
+            target
+                .load_history(&Default::default())
+                .unwrap()
+                .refs
+                .iter()
+                .all(|reference| reference.full_name != "refs/tags/release")
+        );
+
+        // Open the completed form in a fresh context to check submission
+        // from its initial keyboard focus.
+        drop(frames);
+        let mut frames = TestFrames::new();
+        app.dialog.just_opened = true;
+        app.dialog.text_b = "Release notes".to_owned();
+        for _ in 0..3 {
+            frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+        }
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+        assert!(!app.dialog.is_open());
+        assert_eq!(app.active_workdir(), Some(other.workdir()));
+        let history = target.load_history(&Default::default()).unwrap();
+        let tag = history
+            .refs
+            .iter()
+            .find(|reference| reference.full_name == "refs/tags/release")
+            .unwrap();
+        assert_eq!(tag.target, sha);
+        assert!(
+            other
+                .load_history(&Default::default())
+                .unwrap()
+                .refs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn editing_a_remotes_pull_url_saves_the_new_value() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.add_remote("origin", "../old.git").unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        app.dialog.open(DialogKind::EditRemote);
+        app.dialog.ref_name = "origin".to_owned();
+        app.dialog.text_a = "origin".to_owned();
+        app.dialog.text_b = "../new.git".to_owned();
+
+        let mut frames = TestFrames::new();
+        for _ in 0..3 {
+            frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+        }
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| super::super::draw_dialogs(cx, &mut app));
+        assert!(!app.dialog.is_open());
+        assert_eq!(
+            repo.config_string("remote.origin.url").as_deref(),
+            Some("../new.git")
+        );
+        assert_eq!(app.toasts.history()[0].title, "Updated remote origin");
+    }
 
     fn shas(names: &[&str]) -> Vec<Sha> {
         names.iter().map(|name| (*name).to_owned()).collect()

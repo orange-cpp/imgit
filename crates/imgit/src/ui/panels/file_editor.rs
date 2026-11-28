@@ -408,6 +408,184 @@ pub fn draw_file_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use imgit_git::Repository;
+
+    use crate::shell::test_frame::TestFrames;
+
+    fn files() -> (tempfile::TempDir, Repository, Application) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Editor test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("editor@example.invalid"))
+            .unwrap();
+        repo.set_local_config("core.autocrlf", Some("false"))
+            .unwrap();
+        fs::write(repo.workdir().join("first.txt"), "Before\r\nSecond\r\n").unwrap();
+        fs::write(repo.workdir().join("second.txt"), "Other file\n").unwrap();
+        repo.stage(&["first.txt", "second.txt"]).unwrap();
+        repo.commit("File fixtures", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, repo, app)
+    }
+
+    fn draw(cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState) {
+        let origin = cx.cursor();
+        draw_file_editor(
+            cx,
+            app,
+            state,
+            origin,
+            origin + vec2(0.0, 40.0),
+            origin + vec2(650.0, 440.0),
+        );
+    }
+
+    fn open(frames: &mut TestFrames, app: &mut Application, path: &str) {
+        app.with_active(|app, state| {
+            frames.draw(|cx| assert!(open_file_editor(cx, app, state, path)));
+            for _ in 0..3 {
+                frames.draw(|cx| draw(cx, app, state));
+            }
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn saving_a_crlf_file_from_the_editor_returns_to_its_unstaged_diff() {
+        let (_scratch, repo, mut app) = files();
+        let mut frames = TestFrames::new();
+        open(&mut frames, &mut app, "first.txt");
+        app.with_active(|app, state| {
+            let edit = state.file_edit.as_ref().unwrap();
+            assert_eq!(edit.text, "Before\nSecond\n");
+            assert!(edit.crlf);
+            assert!(!edit.is_dirty());
+
+            frames.set_key(Key::ModCtrl, true);
+            frames.set_key(Key::A, true);
+            frames.draw(|cx| draw(cx, app, state));
+            frames.set_key(Key::A, false);
+            frames.set_key(Key::ModCtrl, false);
+            frames.draw(|cx| draw(cx, app, state));
+            frames.type_text("Edited");
+            frames.draw(|cx| draw(cx, app, state));
+            frames.set_key(Key::Enter, true);
+            frames.draw(|cx| draw(cx, app, state));
+            frames.set_key(Key::Enter, false);
+            frames.draw(|cx| draw(cx, app, state));
+            frames.type_text("Second");
+            frames.draw(|cx| draw(cx, app, state));
+            let edit = state.file_edit.as_ref().unwrap();
+            assert_eq!(edit.text, "Edited\nSecond");
+            assert!(edit.is_dirty());
+            assert_eq!(
+                fs::read(repo.workdir().join("first.txt")).unwrap(),
+                b"Before\r\nSecond\r\n"
+            );
+
+            frames.set_key(Key::ModCtrl, true);
+            frames.set_key(Key::S, true);
+            frames.draw(|cx| draw(cx, app, state));
+            assert!(state.file_edit.is_none());
+            assert_eq!(
+                fs::read(repo.workdir().join("first.txt")).unwrap(),
+                b"Edited\r\nSecond"
+            );
+            assert_eq!(state.status.unstaged[0].path, "first.txt");
+            assert!(state.status.staged.is_empty());
+            let target = state.diff_target.as_ref().unwrap();
+            assert_eq!(target.path, "first.txt");
+            assert_eq!(target.source, DiffSource::Unstaged);
+            assert_eq!(app.toasts.history()[0].title, "Saved first.txt");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn escape_and_navigation_keep_unsaved_text_until_discard_is_confirmed() {
+        let (_scratch, repo, mut app) = files();
+        let mut frames = TestFrames::new();
+        open(&mut frames, &mut app, "first.txt");
+        frames.type_text("local edit");
+        frames.draw(|cx| app.with_active(|app, state| draw(cx, app, state)).unwrap());
+        assert!(app.active().unwrap().has_unsaved_edit());
+        let unsaved = app
+            .active()
+            .unwrap()
+            .file_edit
+            .as_ref()
+            .unwrap()
+            .text
+            .clone();
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| app.with_active(|app, state| draw(cx, app, state)).unwrap());
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert_eq!(app.dialog.title, "Discard Changes");
+        assert_eq!(
+            app.active().unwrap().file_edit.as_ref().unwrap().text,
+            unsaved
+        );
+
+        // The prompt's Cancel answer keeps the editor and its unsaved text.
+        frames.set_key(Key::Escape, false);
+        frames.draw(|cx| crate::ui::panels::dialogs::draw_dialogs(cx, &mut app));
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| crate::ui::panels::dialogs::draw_dialogs(cx, &mut app));
+        assert!(!app.dialog.is_open());
+        assert_eq!(
+            app.active().unwrap().file_edit.as_ref().unwrap().text,
+            unsaved
+        );
+
+        frames.set_key(Key::Escape, false);
+        frames.draw(|cx| {
+            app.with_active(|app, state| {
+                assert!(!open_file_editor(cx, app, state, "second.txt"));
+            })
+            .unwrap();
+        });
+        let discard = app.dialog.on_confirm.take().unwrap();
+        frames.draw(|cx| discard(cx, &mut app));
+        let edit = app.active().unwrap().file_edit.as_ref().unwrap();
+        assert_eq!(edit.path, "second.txt");
+        assert_eq!(edit.text, "Other file\n");
+        assert_eq!(
+            fs::read(repo.workdir().join("first.txt")).unwrap(),
+            b"Before\r\nSecond\r\n"
+        );
+    }
+
+    #[test]
+    fn rejected_files_and_failed_saves_preserve_the_current_edit() {
+        let (_scratch, repo, mut app) = files();
+        let root = repo.workdir();
+        fs::write(root.join("binary"), b"T\0xt").unwrap();
+        fs::write(root.join("nonunicode"), [0xFF]).unwrap();
+        fs::File::create(root.join("oversized"))
+            .unwrap()
+            .set_len(MAX_EDIT_SIZE + 1)
+            .unwrap();
+        let mut frames = TestFrames::new();
+        open(&mut frames, &mut app, "first.txt");
+        app.with_active(|app, state| {
+            for name in ["binary", "nonunicode", "oversized", "missing"] {
+                frames.draw(|cx| assert!(!open_file_editor(cx, app, state, name)));
+                assert_eq!(state.file_edit.as_ref().unwrap().path, "first.txt");
+            }
+            let file = root.join("first.txt");
+            fs::remove_file(&file).unwrap();
+            fs::create_dir(&file).unwrap();
+            state.file_edit.as_mut().unwrap().text = "Still editing".to_owned();
+            assert!(!save(app, state));
+            let edit = state.file_edit.as_ref().unwrap();
+            assert_eq!(edit.text, "Still editing");
+            assert!(edit.is_dirty());
+            assert_eq!(app.toasts.history()[0].title, "Could not save first.txt");
+        })
+        .unwrap();
+    }
 
     #[test]
     fn crlf_is_kept_when_most_breaks_are() {

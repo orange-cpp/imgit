@@ -728,3 +728,39 @@ impl Frame for DemoFrame {
         self.state.busy()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn the_gallery_draws_its_widgets_and_f5_applies_the_next_theme() {
+        let mut frames = TestFrames::new();
+        let mut demo = None;
+        frames.draw(|cx| {
+            let mut gallery = DemoFrame::new(&mut cx.shell);
+            gallery.state.avatars.set_enabled(false);
+            gallery.dev_command(DevCommand::SelectRow(3), &mut cx.shell);
+            gallery.draw(cx.ui, &mut cx.shell);
+            demo = Some(gallery);
+        });
+        let mut demo = demo.unwrap();
+        assert_eq!(
+            demo.last_command.as_deref(),
+            Some("dev command: select row 3")
+        );
+        assert!(!frames.uploads().is_empty());
+        assert!(!demo.busy());
+
+        let before = demo.themes.current_theme().to_owned();
+        let expected = demo.next_theme();
+        frames.set_key(Key::F5, true);
+        frames.draw(|cx| demo.draw(cx.ui, &mut cx.shell));
+        assert_ne!(demo.themes.current_theme(), before);
+        assert_eq!(demo.themes.current_theme(), expected);
+        frames.set_key(Key::F5, false);
+        frames.draw(|cx| demo.draw(cx.ui, &mut cx.shell));
+        assert_eq!(demo.themes.current_theme(), expected);
+    }
+}

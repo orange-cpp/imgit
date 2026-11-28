@@ -127,3 +127,47 @@ impl Repository {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repository::tests::ScratchRepository;
+
+    #[test]
+    fn updating_an_older_stash_message_preserves_reflog_order_and_contents() {
+        let scratch = ScratchRepository::new();
+        let repo = &scratch.repo;
+        let base = scratch.commit_file("tracked.txt", b"base\n", "Base");
+        scratch.write("tracked.txt", b"older\n");
+        let older = repo.stash_push("").unwrap();
+        scratch.write("tracked.txt", b"newer\n");
+        let newer = repo.stash_push("Newer").unwrap();
+        let before = repo.stash_entries().unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before[1].1.starts_with("WIP on main:"));
+
+        assert!(repo.stash_set_message(&base, "Missing").is_err());
+        assert_eq!(repo.stash_entries().unwrap(), before);
+        repo.stash_set_message(&older, "Renamed older stash")
+            .unwrap();
+        let after = repo.stash_entries().unwrap();
+        assert_eq!(
+            after,
+            vec![
+                (parse_oid(&newer).unwrap(), "On main: Newer".to_owned()),
+                (
+                    parse_oid(&older).unwrap(),
+                    "On main: Renamed older stash".to_owned()
+                ),
+            ],
+        );
+        assert_eq!(repo.stash_index_of(&newer), Some(0));
+        assert_eq!(repo.stash_index_of(&older), Some(1));
+        repo.stash_pop(1).unwrap();
+        assert_eq!(repo.stash_index_of(&older), None);
+        assert_eq!(
+            std::fs::read(repo.workdir().join("tracked.txt")).unwrap(),
+            b"older\n",
+        );
+    }
+}

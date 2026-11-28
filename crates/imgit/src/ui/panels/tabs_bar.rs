@@ -1234,7 +1234,361 @@ fn display_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::toasts::ToastKind;
+    use crate::shell::test_frame::TestFrames;
     use crate::ui::icons::Icons;
+
+    #[test]
+    fn dragging_a_repository_tab_reorders_it_and_keeps_it_active() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        for name in ["One", "Two", "Three"] {
+            let repo = imgit_git::Repository::init(scratch.path().join(name)).unwrap();
+            app.open_repository(&repo.workdir().to_string_lossy());
+        }
+        let mut frames = TestFrames::new();
+        let mut start = Vec2::ZERO;
+        let mut end = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let tab_left = cx.cursor() + vec2(41.0, TABS_BAR_HEIGHT / 2.0);
+                let icon_width = cx.icon_width(Icon::Branch, cx.px(TAB_ICON_EM));
+                let width = |label: &str| {
+                    TAB_PADDING_LEFT
+                        + icon_width
+                        + TAB_ICON_GAP
+                        + cx.text_size(cx.fonts.semibold, TAB_FONT, label).x
+                        + TAB_PADDING_RIGHT
+                };
+                start = tab_left + vec2(25.0, 0.0);
+                end = tab_left + vec2(width("One") + width("Two") + width("Three") - 5.0, 0.0);
+                draw_tabs_bar(cx, &mut app);
+            });
+        }
+
+        frames.move_mouse(start.into());
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        frames.set_left_mouse(true);
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        assert_eq!(app.active_tab, Some(0));
+
+        frames.move_mouse(end.into());
+        for _ in 0..3 {
+            frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        }
+        frames.set_left_mouse(false);
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        assert_eq!(
+            (app.tab_label(0), app.tab_label(1), app.tab_label(2)),
+            ("Two".to_owned(), "Three".to_owned(), "One".to_owned())
+        );
+        assert_eq!(app.active_tab, Some(2));
+    }
+
+    #[test]
+    fn the_plus_opens_a_new_tab_and_closing_it_restores_the_last_repository() {
+        let (_scratch, _config, mut app) = named_tabs();
+        let mut frames = TestFrames::new();
+        let mut add = Vec2::ZERO;
+        let mut close = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let origin = cx.cursor();
+                let overhead = TAB_PADDING_LEFT + TAB_PADDING_RIGHT;
+                let icon = cx.icon_width(Icon::Branch, cx.px(TAB_ICON_EM));
+                let tabs_width = ["One", "Two", "Three"]
+                    .into_iter()
+                    .map(|name| {
+                        overhead
+                            + icon
+                            + TAB_ICON_GAP
+                            + cx.text_size(cx.fonts.semibold, TAB_FONT, name).x
+                    })
+                    .sum::<f32>();
+                let strip_end = 41.0 + tabs_width;
+                let new_width = overhead + cx.text_size(cx.fonts.regular, TAB_FONT, "New Tab").x;
+                add = origin + vec2(strip_end + 21.5, TABS_BAR_HEIGHT / 2.0);
+                close = origin + vec2(strip_end + new_width - 13.0, TABS_BAR_HEIGHT / 2.0);
+                draw_tabs_bar(cx, &mut app);
+            });
+        }
+        frames.click_left(add, |cx| draw_tabs_bar(cx, &mut app));
+        assert!(app.new_tab_open);
+        assert_eq!(app.active_tab, None);
+        assert_eq!(app.tabs.len(), 3);
+
+        frames.click_left(close, |cx| draw_tabs_bar(cx, &mut app));
+        assert!(!app.new_tab_open);
+        assert_eq!(app.tab_label(app.active_tab.unwrap()), "Three");
+        assert_eq!(app.tabs.len(), 3);
+    }
+
+    #[test]
+    fn clicking_a_group_label_collapses_and_persists_it() {
+        use crate::ui::menu::{draw_menus, menu_open};
+
+        let (_scratch, config, mut app) = named_tabs();
+        for index in [0, 1] {
+            app.set_tab_group(index, Some("Team"));
+        }
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            draw_tabs_bar(cx, app);
+            draw_menus(cx, app);
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw(cx, &mut app);
+            });
+        }
+        let label = origin + vec2(58.0, TABS_BAR_HEIGHT / 2.0);
+        frames.click_left(label, |cx| draw(cx, &mut app));
+        assert!(app.find_tab_group("Team").unwrap().collapsed);
+        assert_eq!(app.tab_label(app.active_tab.unwrap()), "Three");
+
+        let mut reloaded = Application::with_config_directory(config);
+        reloaded.restore_tabs();
+        assert!(reloaded.find_tab_group("Team").unwrap().collapsed);
+        assert_eq!(reloaded.tabs.len(), 3);
+        assert_eq!(reloaded.tab_label(reloaded.active_tab.unwrap()), "Three");
+
+        frames.set_right_mouse(true);
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_right_mouse(false);
+        frames.draw(|cx| {
+            draw(cx, &mut app);
+            assert!(
+                menu_open(cx),
+                "the group label should open its context menu"
+            );
+        });
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_key(Key::Escape, false);
+        frames.click_left(label, |cx| draw(cx, &mut app));
+        assert!(!app.find_tab_group("Team").unwrap().collapsed);
+    }
+
+    #[test]
+    fn tab_naming_actions_follow_the_repository_after_reordering_and_are_saved() {
+        let (_scratch, config, mut app) = named_tabs();
+        let workdir = app.tabs[0].root_workdir.clone();
+        let mut frames = TestFrames::new();
+
+        let rename = take_tab_action(naming_items(&app, 0), "Rename tab");
+        app.move_tab(0, 2);
+        frames.draw(|cx| rename(cx, &mut app));
+        assert!(app.dialog.is(DialogKind::TextPrompt));
+        assert_eq!(app.dialog.text_a, "One");
+        answer_prompt(&mut frames, &mut app, "Review");
+        assert_eq!(app.tab_label(2), "Review");
+        assert_eq!(app.tabs[2].root_workdir, workdir);
+        assert_eq!(app.tab_label(0), "Two");
+
+        tab_action(&mut frames, &mut app, 2, "Alias repository");
+        assert!(app.dialog.text_a.is_empty());
+        assert!(app.dialog.message.contains("Alias repository 'One'"));
+        answer_prompt(&mut frames, &mut app, "Shared alias");
+        assert_eq!(app.tab_label(2), "Review");
+        tab_action(&mut frames, &mut app, 2, "Reset tab name");
+        assert_eq!(app.tab_label(2), "Shared alias");
+
+        tab_action(&mut frames, &mut app, 2, "Rename tab");
+        assert_eq!(app.dialog.text_a, "Shared alias");
+        answer_prompt(&mut frames, &mut app, "Shared alias");
+        assert_eq!(app.tabs[2].name, None);
+
+        let submenu = |app: &Application, index| {
+            naming_items(app, index)
+                .into_iter()
+                .find(|item| item.label == "Add tab to group")
+                .unwrap()
+                .submenu
+        };
+        let new = take_tab_action(submenu(&app, 2), "New group...");
+        frames.draw(|cx| new(cx, &mut app));
+        assert!(!app.dialog.flag);
+        answer_prompt(&mut frames, &mut app, "Review work");
+        let existing = take_tab_action(submenu(&app, 0), "Review work");
+        frames.draw(|cx| existing(cx, &mut app));
+        let desired = app
+            .tabs
+            .iter()
+            .position(|tab| tab.root_workdir == workdir)
+            .unwrap();
+        assert_eq!(
+            app.tabs
+                .iter()
+                .filter(|tab| tab.group.as_deref() == Some("Review work"))
+                .count(),
+            2
+        );
+        tab_action(&mut frames, &mut app, desired, "Remove tab from group");
+
+        let mut reloaded = Application::with_config_directory(config);
+        reloaded.restore_tabs();
+        let tab = reloaded
+            .tabs
+            .iter()
+            .find(|tab| tab.root_workdir == workdir)
+            .unwrap();
+        assert_eq!(tab.group, None);
+        assert_eq!(tab.name, None);
+        assert_eq!(reloaded.repo_display_name(&workdir), "Shared alias");
+        assert_eq!(
+            reloaded
+                .tabs
+                .iter()
+                .filter(|tab| tab.group.as_deref() == Some("Review work"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn group_menu_renames_recolors_and_closes_only_its_own_tabs() {
+        let (_scratch, _config, mut app) = named_tabs();
+        app.set_tab_group(0, Some("Review"));
+        app.set_tab_group(1, Some("Review"));
+        app.find_tab_group_mut("Review").unwrap().color = GRAPH_COLOR_COUNT - 1;
+        let mut frames = TestFrames::new();
+        let choose = |frames: &mut TestFrames, app: &mut Application, group, label| {
+            let action = take_tab_action(tab_group_menu(app, group), label);
+            frames.draw(|cx| action(cx, app));
+        };
+        assert!(tab_group_menu(&app, "missing").is_empty());
+
+        choose(&mut frames, &mut app, "Review", "Collapse group");
+        assert!(app.find_tab_group("Review").unwrap().collapsed);
+        choose(&mut frames, &mut app, "Review", "Expand group");
+        assert!(!app.find_tab_group("Review").unwrap().collapsed);
+        choose(&mut frames, &mut app, "Review", "Next color");
+        assert_eq!(app.find_tab_group("Review").unwrap().color, 0);
+        choose(&mut frames, &mut app, "Review", "Rename group");
+        assert_eq!(app.dialog.text_a, "Review");
+        answer_prompt(&mut frames, &mut app, "Ready");
+        assert!(app.find_tab_group("Review").is_none());
+        assert_eq!(app.tabs[0].group.as_deref(), Some("Ready"));
+        choose(&mut frames, &mut app, "Ready", "Ungroup");
+        assert!(app.tab_groups.is_empty());
+        assert_eq!(app.tabs.len(), 3);
+
+        app.set_tab_group(0, Some("Close these"));
+        app.set_tab_group(1, Some("Close these"));
+        choose(&mut frames, &mut app, "Close these", "Close group");
+        assert!(app.tab_groups.is_empty());
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tab_label(0), "Three");
+        assert_eq!(app.active_tab, Some(0));
+    }
+
+    fn named_tabs() -> (tempfile::TempDir, std::path::PathBuf, Application) {
+        let scratch = tempfile::tempdir().unwrap();
+        let config = scratch.path().join("config");
+        let mut app = Application::with_config_directory(config.clone());
+        app.settings.remember_tabs = true;
+        for name in ["One", "Two", "Three"] {
+            let repo = imgit_git::Repository::init(scratch.path().join(name)).unwrap();
+            app.open_repository(&repo.workdir().to_string_lossy());
+        }
+        (scratch, config, app)
+    }
+
+    fn take_tab_action(items: MenuItems, label: &str) -> crate::app::action::Action {
+        let item = items
+            .into_iter()
+            .find(|item| item.label == label)
+            .unwrap_or_else(|| panic!("missing {label}"));
+        assert!(item.enabled);
+        item.click.unwrap()
+    }
+
+    fn tab_action(frames: &mut TestFrames, app: &mut Application, index: usize, label: &str) {
+        frames.draw(|cx| take_tab_action(tab_naming_items(cx, app, index), label)(cx, app));
+    }
+
+    fn answer_prompt(frames: &mut TestFrames, app: &mut Application, text: &str) {
+        let answer = app.dialog.on_text.take().unwrap();
+        app.dialog.close();
+        frames.draw(|cx| answer(cx, app, text));
+    }
+
+    #[test]
+    fn searching_open_tabs_activates_the_match_on_enter() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        for name in ["First", "Second"] {
+            let repo = imgit_git::Repository::init(scratch.path().join(name)).unwrap();
+            app.open_repository(&repo.workdir().to_string_lossy());
+        }
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        app.tabs_list_requested = true;
+        for _ in 0..3 {
+            frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        }
+        assert_eq!(app.active_tab, Some(1));
+        frames.type_text("fir");
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        assert_eq!(app.active_tab, Some(0));
+    }
+
+    #[test]
+    fn the_new_tab_filter_opens_the_matching_recent_repository() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let wanted = imgit_git::Repository::init(scratch.path().join("Target")).unwrap();
+        let other = imgit_git::Repository::init(scratch.path().join("Other")).unwrap();
+        app.recent_repos = vec![other.workdir().to_owned(), wanted.workdir().to_owned()];
+        app.new_tab_open = true;
+
+        let mut frames = TestFrames::new();
+        let size = vec2(1180.0, 650.0);
+        let mut first_link = Vec2::ZERO;
+        for _ in 0..3 {
+            frames.draw(|cx| {
+                first_link = cx.cursor() + vec2(115.0, 226.0);
+                draw_new_tab_view(cx, &mut app, size);
+            });
+        }
+
+        frames.type_text("Target");
+        frames.draw(|cx| draw_new_tab_view(cx, &mut app, size));
+        frames.click_left(first_link, |cx| draw_new_tab_view(cx, &mut app, size));
+        assert_eq!(app.active_workdir(), Some(wanted.workdir()));
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn closing_notifications_marks_the_history_read() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.toasts.push_with_detail(
+            ToastKind::Error,
+            "Fetch failed",
+            "The remote is unavailable.",
+        );
+        app.toasts.push(ToastKind::Success, "Repository refreshed");
+        assert_eq!(app.toasts.unread(), 2);
+
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        app.notifications_requested = true;
+        for _ in 0..3 {
+            frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        }
+        assert_eq!(app.toasts.unread(), 2);
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        frames.set_key(Key::Escape, false);
+        frames.draw(|cx| draw_tabs_bar(cx, &mut app));
+        assert_eq!(app.toasts.unread(), 0);
+        assert_eq!(app.toasts.history().len(), 2);
+    }
 
     #[test]
     fn a_dragged_tab_swaps_past_its_neighbours_centre() {

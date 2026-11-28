@@ -300,6 +300,139 @@ pub fn draw_preferences(cx: &mut Cx<'_>, app: &mut Application, size: Vec2) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+    use dear_imgui_rs::Key;
+
+    #[test]
+    fn the_auto_fetch_interval_is_clamped_and_saved_when_the_field_loses_focus() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.preferences_page = "General".to_owned();
+        app.settings.auto_fetch_minutes = 9;
+        let mut frames = TestFrames::new();
+        let size = vec2(1260.0, 730.0);
+        let mut field = Vec2::ZERO;
+        let mut outside = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let page_left = 300.0;
+                let control = 55.0 + (size.x - page_left - 110.0) / 4.0 + 15.0;
+                field = cx.cursor() + vec2(page_left + control + 30.0, 73.0);
+                outside = cx.cursor() + vec2(page_left + 70.0, 28.0);
+                draw_preferences(cx, &mut app, size);
+            });
+        }
+
+        frames.click_left(field, |cx| draw_preferences(cx, &mut app, size));
+        frames.set_key(Key::ModCtrl, true);
+        frames.set_key(Key::A, true);
+        frames.draw(|cx| draw_preferences(cx, &mut app, size));
+        frames.set_key(Key::A, false);
+        frames.set_key(Key::ModCtrl, false);
+        frames.draw(|cx| draw_preferences(cx, &mut app, size));
+        frames.type_text("999");
+        frames.draw(|cx| draw_preferences(cx, &mut app, size));
+        assert_eq!(app.settings.auto_fetch_minutes, 9);
+
+        frames.click_left(outside, |cx| draw_preferences(cx, &mut app, size));
+        assert_eq!(app.settings.auto_fetch_minutes, 60);
+        let mut stored = crate::app::settings::Settings::default();
+        stored.load(&app.config_path("settings.txt"));
+        assert_eq!(stored.auto_fetch_minutes, 60);
+    }
+
+    #[test]
+    fn choosing_a_custom_theme_from_the_select_applies_and_saves_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.preferences_page = "UI Customization".to_owned();
+        let themes = app.config_path("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::write(
+            themes.join("test.json"),
+            r##"{"name":"Coverage Theme","base":"ImGit Light","accent":"#2F7D6D"}"##,
+        )
+        .unwrap();
+        let size = vec2(1260.0, 730.0);
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| app.reload_custom_themes(cx, false));
+
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            draw_preferences(cx, app, size);
+            crate::ui::menu::draw_menus(cx, app);
+        };
+        let mut theme_select = Vec2::ZERO;
+        let mut custom_index = None;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let control = 55.0 + (size.x - 300.0 - 110.0) / 4.0 + 15.0;
+                theme_select = cx.cursor() + vec2(300.0 + control + 45.0, 73.0);
+                custom_index = cx
+                    .state
+                    .theme_names
+                    .iter()
+                    .position(|name| name == "Coverage Theme");
+                draw(cx, &mut app);
+            });
+        }
+        frames.click_left(theme_select, |cx| draw(cx, &mut app));
+        for _ in 0..=custom_index.unwrap() {
+            frames.set_key(Key::DownArrow, true);
+            frames.draw(|cx| draw(cx, &mut app));
+            frames.set_key(Key::DownArrow, false);
+            frames.draw(|cx| draw(cx, &mut app));
+        }
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(app.settings.theme, "Coverage Theme");
+
+        frames.draw(|cx| {
+            assert_eq!(cx.state.theme_name, "Coverage Theme");
+            assert_eq!(cx.palette.accent, crate::theme::Color::rgb(0x2F7D6D));
+        });
+        let mut stored = crate::app::settings::Settings::default();
+        stored.load(&app.config_path("settings.txt"));
+        assert_eq!(stored.theme, "Coverage Theme");
+    }
+
+    #[test]
+    fn the_preferences_sidebar_opens_other_pages_and_returns_to_the_repository() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        app.preferences_open = true;
+        let size = vec2(1260.0, 730.0);
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw_preferences(cx, &mut app, size);
+            });
+        }
+        for page in [
+            "SSH",
+            "External Tools",
+            "Notifications",
+            "Editor",
+            "In-App Terminal",
+        ] {
+            let index = GLOBAL_PAGES
+                .iter()
+                .position(|entry| entry.name == page)
+                .unwrap();
+            let row = origin + vec2(100.0, 162.7 + 45.703_125 * index as f32 + 22.0);
+            frames.click_left(row, |cx| draw_preferences(cx, &mut app, size));
+            assert_eq!(app.preferences_page, page);
+            assert!(app.preferences_open);
+        }
+        frames.click_left(origin + vec2(65.0, 20.0), |cx| {
+            draw_preferences(cx, &mut app, size)
+        });
+        assert!(!app.preferences_open);
+        assert_eq!(app.active_workdir(), Some(repo.workdir()));
+    }
 
     #[test]
     fn page_names_are_unique() {

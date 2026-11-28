@@ -865,6 +865,327 @@ pub(super) fn load_sparse_draft(app: &mut Application) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use imgit_app::profiles::Profile;
+    use imgit_git::Repository;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn local_git_values_refresh_on_expiry_write_and_repository_change() {
+        let scratch = tempfile::tempdir().unwrap();
+        let first = Repository::init(scratch.path().join("first")).unwrap();
+        let second = Repository::init(scratch.path().join("second")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let key = "imgit-coverage.sample";
+
+        assert!(git_flag(&mut app, Scope::Repo, key, true));
+        assert!(!git_flag(&mut app, Scope::Repo, key, false));
+        set_git_value(&mut app, Scope::Repo, key, "on");
+        let error = &app.toasts.history()[0];
+        assert_eq!(error.kind, ToastKind::Error);
+        assert_eq!(error.detail, "Open a repository first.");
+
+        first.set_local_config(key, Some("YES")).unwrap();
+        second.set_local_config(key, Some("1")).unwrap();
+        app.open_repository(&first.workdir().to_string_lossy());
+        assert!(git_flag(&mut app, Scope::Repo, key, false));
+        first.set_local_config(key, Some("off")).unwrap();
+        app.panels.preferences.now = 2.0;
+        assert_eq!(git_value(&mut app, Scope::Repo, key), "YES");
+        app.panels.preferences.now = 2.01;
+        assert!(!git_flag(&mut app, Scope::Repo, key, true));
+
+        set_git_value(&mut app, Scope::Repo, key, "true");
+        assert_eq!(first.config_string(key).as_deref(), Some("true"));
+        assert_eq!(git_value(&mut app, Scope::Repo, key), "true");
+        set_git_value(&mut app, Scope::Repo, key, "");
+        assert!(first.config_string(key).is_none());
+        assert_eq!(git_value(&mut app, Scope::Repo, key), "");
+        app.open_repository(&second.workdir().to_string_lossy());
+        assert_eq!(git_value(&mut app, Scope::Repo, key), "1");
+    }
+
+    #[test]
+    fn preferences_context_tracks_repository_and_profile_changes() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("worktree")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let guid = app
+            .profiles
+            .create(
+                Profile {
+                    name: "Contributor".to_owned(),
+                    user_name: "Profile Name".to_owned(),
+                    user_email: "profile@example.invalid".to_owned(),
+                    ..Profile::default()
+                },
+                false,
+            )
+            .unwrap();
+        app.profiles.set_current(&guid).unwrap();
+        let profile = context(&mut app);
+        assert_eq!(profile.author.name, "Profile Name");
+        assert_eq!(profile.author.email, "profile@example.invalid");
+        assert!(profile.repo_name.is_empty());
+        assert!(profile.hooks_path.is_empty());
+
+        repo.set_local_config("user.name", Some("Repository Name"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("repository@example.invalid"))
+            .unwrap();
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let repository = context(&mut app);
+        assert_eq!(repository.author.name, "Repository Name");
+        assert_eq!(repository.author.email, "repository@example.invalid");
+        assert_eq!(repository.repo_name, "worktree");
+        assert_eq!(
+            Path::new(&repository.hooks_path),
+            repo.workdir().join(".git").join("hooks")
+        );
+        assert_eq!(repository.home, profile.home);
+
+        repo.set_local_config("user.email", Some("updated@example.invalid"))
+            .unwrap();
+        assert_eq!(context(&mut app).author.email, "repository@example.invalid");
+        assert_eq!(read_context(&app).author.email, "updated@example.invalid");
+        let mut profile = app.profiles.current().clone();
+        profile.user_name = "Profile edit".to_owned();
+        app.profiles.update(&profile).unwrap();
+        assert_eq!(context(&mut app).author.email, "updated@example.invalid");
+    }
+
+    #[test]
+    fn changing_repositories_reloads_gitflow_template_and_sparse_drafts() {
+        let scratch = tempfile::tempdir().unwrap();
+        let configured = Repository::init(scratch.path().join("configured")).unwrap();
+        let clean = Repository::init(scratch.path().join("clean")).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+
+        initialize_gitflow(&mut app);
+        assert_eq!(app.toasts.history()[0].detail, "Open a repository first.");
+        load_gitflow_draft(&mut app);
+        assert_eq!(
+            app.panels.preferences.gitflow.values,
+            ["main", "develop", "feature/", "release/", "hotfix/", ""],
+        );
+        load_template_draft(&mut app);
+        load_sparse_draft(&mut app);
+        assert!(app.panels.preferences.template.summary.is_empty());
+        assert!(app.panels.preferences.sparse.paths.is_empty());
+
+        for (key, value) in [
+            ("gitflow.branch.master", "trunk"),
+            ("gitflow.branch.develop", "staging"),
+            ("gitflow.prefix.feature", "work/"),
+            ("commit.template", "template.txt"),
+        ] {
+            configured.set_local_config(key, Some(value)).unwrap();
+        }
+        fs::write(
+            configured.workdir().join("template.txt"),
+            "Subject\n\nBody\n# ignored\n",
+        )
+        .unwrap();
+        let info = configured.git_dir().join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("sparse-checkout"), "/*\n!/*/\n/src/\n").unwrap();
+
+        app.open_repository(&configured.workdir().to_string_lossy());
+        load_gitflow_draft(&mut app);
+        load_template_draft(&mut app);
+        load_sparse_draft(&mut app);
+        assert_eq!(
+            app.panels.preferences.gitflow.values,
+            ["trunk", "staging", "work/", "", "", ""],
+        );
+        assert_eq!(app.panels.preferences.template.saved_summary, "Subject");
+        assert_eq!(app.panels.preferences.template.saved_description, "Body");
+        assert_eq!(app.panels.preferences.sparse.paths, "src/\n");
+
+        app.panels.preferences.gitflow.values[0] = "unknown".to_owned();
+        app.panels.preferences.template.summary = "Unsaved subject".to_owned();
+        app.panels.preferences.sparse.paths = "unsaved/\n".to_owned();
+        initialize_gitflow(&mut app);
+        assert_eq!(
+            app.toasts.history()[0].detail,
+            "There is no local branch 'unknown'."
+        );
+        load_template_draft(&mut app);
+        load_sparse_draft(&mut app);
+        assert_eq!(app.panels.preferences.template.summary, "Unsaved subject");
+        assert_eq!(app.panels.preferences.sparse.paths, "unsaved/\n");
+
+        app.open_repository(&clean.workdir().to_string_lossy());
+        load_gitflow_draft(&mut app);
+        load_template_draft(&mut app);
+        load_sparse_draft(&mut app);
+        assert_eq!(app.panels.preferences.gitflow.values[0], "main");
+        assert!(app.panels.preferences.template.summary.is_empty());
+        assert!(app.panels.preferences.template.saved_description.is_empty());
+        assert!(app.panels.preferences.sparse.paths.is_empty());
+    }
+
+    #[test]
+    fn the_commit_signing_page_refreshes_the_list_and_opens_format_choices() {
+        use crate::shell::test_frame::TestFrames;
+        use crate::ui::menu::{draw_menus, menu_open};
+        use crate::ui::{Cx, vec2};
+        use dear_imgui_rs::Key;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.preferences_page = "Commit Signing".to_owned();
+        let missing = scratch
+            .path()
+            .join("unavailable-gpg")
+            .to_string_lossy()
+            .into_owned();
+        let values = &mut app.panels.preferences.git.values;
+        for (setting, value) in [
+            ("gpg.format", ""),
+            ("gpg.program", missing.as_str()),
+            ("commit.gpgsign", "true"),
+            ("tag.gpgSign", "false"),
+            ("user.signingkey", "missing-key"),
+        ] {
+            values.insert(format!("global:{setting}"), value.to_owned());
+        }
+        app.panels.preferences.signing_keys = vec!["stale key".to_owned()];
+        app.panels.preferences.passphrase = "temporary input".to_owned();
+        let size = vec2(1260.0, 700.0);
+        let mut frames = TestFrames::new();
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            super::super::draw_preferences(cx, app, size);
+            draw_menus(cx, app);
+        };
+        let mut format = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let control = 55.0 + (size.x - 300.0 - 110.0) / 4.0 + 15.0;
+                format = cx.cursor() + vec2(300.0 + control + 80.0, 73.0);
+                draw(cx, &mut app);
+            });
+        }
+        assert!(app.panels.preferences.signing_keys_read);
+        assert!(app.background_running("gpg-keys"));
+        wait_for_signing_job(&mut app, "gpg-keys");
+        assert_eq!(app.panels.preferences.signing_keys, ["<None>"]);
+        assert_eq!(app.panels.preferences.passphrase, "temporary input");
+
+        let mut open = false;
+        frames.click_left(format, |cx| {
+            draw(cx, &mut app);
+            open = menu_open(cx);
+        });
+        assert!(open, "GPG Format should open its options");
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| {
+            draw(cx, &mut app);
+            assert!(!menu_open(cx));
+        });
+
+        app.panels
+            .preferences
+            .git
+            .values
+            .insert("global:gpg.format".to_owned(), "ssh".to_owned());
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!(!app.background_running("gpg-keys"));
+        assert_eq!(app.panels.preferences.passphrase, "temporary input");
+    }
+
+    #[test]
+    fn signing_key_refresh_and_generation_handle_a_missing_gpg_program() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let guid = app
+            .profiles
+            .create(
+                Profile {
+                    name: "Signing test".to_owned(),
+                    user_email: "signing@example.invalid".to_owned(),
+                    ..Profile::default()
+                },
+                false,
+            )
+            .unwrap();
+        app.profiles.set_current(&guid).unwrap();
+        let missing = scratch
+            .path()
+            .join("gpg-unavailable")
+            .to_string_lossy()
+            .into_owned();
+        let git_values = &mut app.panels.preferences.git.values;
+        git_values.insert("global:gpg.program".to_owned(), missing.clone());
+        git_values.insert("global:gpg.format".to_owned(), "openpgp".to_owned());
+        app.panels.preferences.signing_keys = vec!["stale choice".to_owned()];
+
+        refresh_signing_keys(&mut app);
+        refresh_signing_keys(&mut app);
+        assert!(app.panels.preferences.signing_keys_read);
+        assert!(app.background_running("gpg-keys"));
+        wait_for_signing_job(&mut app, "gpg-keys");
+        assert_eq!(app.panels.preferences.signing_keys, ["<None>"]);
+
+        generate_gpg_key(&mut app, "test passphrase");
+        generate_gpg_key(&mut app, "test passphrase");
+        assert_eq!(
+            app.toasts.history()[0].title,
+            "A GPG key is already being generated"
+        );
+        wait_for_signing_job(&mut app, "gpg-generate");
+        let error = &app.toasts.history()[0];
+        assert_eq!(error.kind, ToastKind::Error);
+        assert_eq!(error.detail, format!("{missing} was not found."));
+    }
+
+    #[test]
+    fn gpg_generation_validates_signing_mode_and_profile_email_before_starting() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        let guid = app
+            .profiles
+            .create(
+                Profile {
+                    name: "Unnamed author".to_owned(),
+                    ..Profile::default()
+                },
+                false,
+            )
+            .unwrap();
+        app.profiles.set_current(&guid).unwrap();
+        app.panels
+            .preferences
+            .git
+            .values
+            .insert("global:gpg.format".to_owned(), "SSH".to_owned());
+
+        generate_gpg_key(&mut app, "");
+        assert!(!app.background_running("gpg-generate"));
+        let error = &app.toasts.history()[0];
+        assert_eq!(error.kind, ToastKind::Error);
+        assert!(error.detail.contains("gpg.format is ssh"));
+
+        app.panels
+            .preferences
+            .git
+            .values
+            .insert("global:gpg.format".to_owned(), "openpgp".to_owned());
+        generate_gpg_key(&mut app, "");
+        assert!(!app.background_running("gpg-generate"));
+        assert_eq!(
+            app.toasts.history()[0].detail,
+            "Set your email in your profile first."
+        );
+    }
+
+    fn wait_for_signing_job(app: &mut Application, tag: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.background_running(tag) {
+            assert!(Instant::now() < deadline, "{tag} timed out");
+            app.poll_background();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn secret_keys_pair_with_their_first_user_id() {

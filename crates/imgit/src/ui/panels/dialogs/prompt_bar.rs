@@ -998,6 +998,186 @@ pub fn draw_rename_prompt(cx: &mut Cx<'_>, d: &mut Dialog, caret_to_end: &mut bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn a_dangerous_confirmation_requires_the_confirm_button() {
+        let mut frames = TestFrames::new();
+        let message = "Delete this branch?";
+        let confirm = "Delete";
+        let mut answer = Answer::Pending;
+        let mut confirm_at = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let bar = Bar::new(cx);
+                let question = cx.text_size(cx.fonts.regular, 14.0, message).x;
+                let yes = button_width(cx, confirm);
+                let no = button_width(cx, "Cancel");
+                let left = bar.start_x(cx, question + yes + no + 42.0);
+                confirm_at = vec2(left + question + 22.0 + yes / 2.0, bar.min.y + 24.0);
+                answer = draw_prompt_bar(cx, message, confirm, true);
+            });
+        }
+        assert_eq!(answer, Answer::Pending);
+
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| answer = draw_prompt_bar(cx, message, confirm, true));
+        assert_eq!(answer, Answer::No);
+        frames.set_key(Key::Enter, false);
+
+        frames.click_left(confirm_at, |cx| {
+            answer = draw_prompt_bar(cx, message, confirm, true)
+        });
+        assert_eq!(answer, Answer::Yes);
+    }
+
+    #[test]
+    fn renaming_starts_at_the_end_and_submits_the_edited_name() {
+        let mut frames = TestFrames::new();
+        let mut dialog = Dialog::default();
+        dialog.open(DialogKind::RenameBranch);
+        dialog.ref_name = "topic".to_owned();
+        dialog.text_a = dialog.ref_name.clone();
+        let mut caret_to_end = false;
+        for _ in 0..3 {
+            frames.draw(|cx| {
+                assert_eq!(
+                    draw_rename_prompt(cx, &mut dialog, &mut caret_to_end),
+                    Answer::Pending
+                )
+            });
+        }
+
+        frames.type_text("-next");
+        frames.draw(|cx| {
+            assert_eq!(
+                draw_rename_prompt(cx, &mut dialog, &mut caret_to_end),
+                Answer::Pending
+            )
+        });
+        assert_eq!(dialog.text_a, "topic-next");
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| {
+            assert_eq!(
+                draw_rename_prompt(cx, &mut dialog, &mut caret_to_end),
+                Answer::Yes
+            )
+        });
+    }
+
+    #[test]
+    fn a_rename_starting_with_a_dash_cannot_be_submitted() {
+        let mut frames = TestFrames::new();
+        let mut dialog = Dialog::default();
+        dialog.open(DialogKind::RenameBranch);
+        dialog.ref_name = "topic".to_owned();
+        dialog.text_a = "-invalid".to_owned();
+        let mut caret_to_end = false;
+        let mut answer = Answer::Pending;
+        for _ in 0..3 {
+            frames.draw(|cx| answer = draw_rename_prompt(cx, &mut dialog, &mut caret_to_end));
+        }
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| answer = draw_rename_prompt(cx, &mut dialog, &mut caret_to_end));
+        assert_eq!(answer, Answer::Pending);
+
+        frames.set_key(Key::Enter, false);
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| answer = draw_rename_prompt(cx, &mut dialog, &mut caret_to_end));
+        assert_eq!(answer, Answer::No);
+    }
+
+    #[test]
+    fn credentials_require_a_secret_even_when_the_username_is_prefilled() {
+        let mut frames = TestFrames::new();
+        let mut prompt = CredentialPrompt {
+            url: "https://github.com".to_owned(),
+            username: "example-user".to_owned(),
+            password: String::new(),
+            remember: true,
+            rejected: true,
+            just_opened: true,
+            retry: None,
+        };
+        let mut answer = Answer::Pending;
+        for _ in 0..3 {
+            frames.draw(|cx| answer = draw_credentials_prompt(cx, &mut prompt));
+        }
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| answer = draw_credentials_prompt(cx, &mut prompt));
+        assert_eq!(answer, Answer::Pending);
+        frames.set_key(Key::Enter, false);
+        frames.draw(|cx| {
+            draw_credentials_prompt(cx, &mut prompt);
+        });
+
+        // Give a fresh prompt focus in its password field.
+        prompt.just_opened = true;
+        for _ in 0..3 {
+            frames.draw(|cx| {
+                draw_credentials_prompt(cx, &mut prompt);
+            });
+        }
+        frames.type_text("example-token");
+        frames.draw(|cx| answer = draw_credentials_prompt(cx, &mut prompt));
+        assert_eq!(prompt.password, "example-token");
+        assert_eq!(answer, Answer::Pending);
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| answer = draw_credentials_prompt(cx, &mut prompt));
+        assert_eq!(answer, Answer::Yes);
+    }
+
+    #[test]
+    fn push_prompt_submits_the_remote_picked_from_its_menu() {
+        let mut frames = TestFrames::new();
+        let mut dialog = Dialog::default();
+        dialog.open(DialogKind::PushNewBranch);
+        dialog.ref_name = "topic".to_owned();
+        dialog.text_a = "origin".to_owned();
+        let remotes = [
+            Remote {
+                name: "origin".to_owned(),
+                ..Remote::default()
+            },
+            Remote {
+                name: "backup".to_owned(),
+                ..Remote::default()
+            },
+        ];
+        let mut answer = Answer::Pending;
+        let mut focused = false;
+        let mut remote_box = Vec2::ZERO;
+
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                let bar = Bar::new(cx);
+                let message_w = cx
+                    .text_size(cx.fonts.regular, 14.0, &push_question(&dialog.ref_name))
+                    .x;
+                let slash_w = cx.text_size(cx.fonts.regular, 18.0, "/").x;
+                let buttons = button_width(cx, "Submit") + button_width(cx, "Cancel");
+                let total = message_w + slash_w + buttons + 150.0 + 191.0 + 2.0 * cx.px(7.5) + 42.0;
+                remote_box = vec2(bar.start_x(cx, total) + message_w + 50.0, bar.min.y + 24.0);
+                answer = draw_push_prompt(cx, &mut dialog, &mut focused, &remotes);
+            });
+        }
+        frames.click_left(remote_box, |cx| {
+            answer = draw_push_prompt(cx, &mut dialog, &mut focused, &remotes)
+        });
+        assert!(dialog.flag);
+        let second_option = remote_box + vec2(0.0, 34.0 + 8.0 + 37.0);
+        frames.click_left(second_option, |cx| {
+            answer = draw_push_prompt(cx, &mut dialog, &mut focused, &remotes)
+        });
+        assert_eq!(dialog.text_a, "backup");
+        assert!(!dialog.flag);
+        assert_eq!(answer, Answer::Pending);
+
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| answer = draw_push_prompt(cx, &mut dialog, &mut focused, &remotes));
+        assert_eq!(answer, Answer::Yes);
+        assert!(dialog.text_b.is_empty());
+    }
 
     #[test]
     fn hosting_services_are_told_by_host() {

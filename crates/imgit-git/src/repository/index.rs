@@ -626,3 +626,258 @@ fn remove_untracked(workdir: &Path, relative: &Path, kept: &mut Vec<String>) {
         let _ = std::fs::remove_dir(&path);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn repository() -> (tempfile::TempDir, Repository) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path()).unwrap();
+        repo.set_local_config("user.name", Some("Index test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("index@example.invalid"))
+            .unwrap();
+        repo.set_local_config("core.autocrlf", Some("false"))
+            .unwrap();
+        (scratch, repo)
+    }
+
+    fn write(repo: &Repository, path: &str, bytes: &[u8]) {
+        fs::write(repo.workdir().join(path), bytes).unwrap();
+    }
+
+    fn stage_commit(repo: &Repository, path: &str, bytes: &[u8]) -> Sha {
+        write(repo, path, bytes);
+        repo.stage(&[path]).unwrap();
+        repo.commit("Base", false).unwrap()
+    }
+
+    fn staged(repo: &Repository, path: &str) -> Option<Vec<u8>> {
+        let entry = repo.repo.index().unwrap().get_path(Path::new(path), 0)?;
+        Some(repo.repo.find_blob(entry.id).unwrap().content().to_vec())
+    }
+
+    const fn added(lineno: u32) -> LineSelection {
+        LineSelection {
+            origin: LineOrigin::Added,
+            lineno,
+        }
+    }
+
+    const fn deleted(lineno: u32) -> LineSelection {
+        LineSelection {
+            origin: LineOrigin::Deleted,
+            lineno,
+        }
+    }
+
+    #[test]
+    fn discarding_all_restores_tracked_entries_and_keeps_nested_repositories() {
+        let (_scratch, repo) = repository();
+        let root = repo.workdir();
+        let head = stage_commit(&repo, "original.txt", b"HEAD\n");
+        fs::rename(root.join("original.txt"), root.join("renamed.txt")).unwrap();
+        fs::create_dir(root.join("mixed")).unwrap();
+        let nested = Repository::init(root.join("mixed").join("nested")).unwrap();
+        write(&nested, "keep.txt", b"Nested work\n");
+        write(&repo, "mixed/loose.txt", b"Remove this\n");
+        write(&repo, "added.txt", b"New file\n");
+        repo.stage(&["original.txt", "renamed.txt", "added.txt"])
+            .unwrap();
+
+        repo.unstage_all().unwrap();
+        let status = repo.load_status().unwrap();
+        assert!(status.staged.is_empty());
+        assert_eq!(
+            staged(&repo, "original.txt").as_deref(),
+            Some(b"HEAD\n".as_slice())
+        );
+        assert!(staged(&repo, "renamed.txt").is_none());
+        assert!(root.join("renamed.txt").is_file());
+        assert!(!root.join("original.txt").exists());
+
+        repo.stage(&["original.txt", "renamed.txt", "added.txt"])
+            .unwrap();
+        let remaining = repo.discard_all().unwrap_err().to_string();
+        assert!(remaining.contains("mixed/nested"), "{remaining}");
+        assert_eq!(
+            repo.load_history(&Default::default())
+                .unwrap()
+                .head_sha
+                .as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(fs::read(root.join("original.txt")).unwrap(), b"HEAD\n");
+        assert!(!root.join("renamed.txt").exists());
+        assert!(!root.join("added.txt").exists());
+        assert!(!root.join("mixed").join("loose.txt").exists());
+        assert_eq!(
+            fs::read(nested.workdir().join("keep.txt")).unwrap(),
+            b"Nested work\n"
+        );
+        assert!(repo.load_status().unwrap().staged.is_empty());
+    }
+
+    #[test]
+    fn an_unborn_index_can_be_unstaged_and_cannot_be_amended() {
+        let (_scratch, repo) = repository();
+        assert!(
+            repo.commit("Amend", true)
+                .unwrap_err()
+                .to_string()
+                .contains("nothing to amend")
+        );
+        write(&repo, "new.txt", b"Initial\n");
+        repo.stage(&["new.txt"]).unwrap();
+        assert!(staged(&repo, "new.txt").is_some());
+        repo.unstage_all().unwrap();
+        repo.unstage_all().unwrap();
+        assert!(staged(&repo, "new.txt").is_none());
+        assert_eq!(
+            fs::read(repo.workdir().join("new.txt")).unwrap(),
+            b"Initial\n"
+        );
+    }
+
+    #[test]
+    fn line_staging_and_unstaging_preserve_the_final_unterminated_line() {
+        let (_scratch, repo) = repository();
+        let file = "partial.txt";
+        stage_commit(&repo, file, b"a\nb");
+        write(&repo, file, b"a\nx\ny\n");
+        // The index keeps 'b' with a newly added separator before the selected 'y'.
+        repo.apply_lines(file, &[added(3)], false).unwrap();
+        assert_eq!(
+            staged(&repo, file).as_deref(),
+            Some(b"a\nb\ny\n".as_slice())
+        );
+        assert_eq!(fs::read(repo.workdir().join(file)).unwrap(), b"a\nx\ny\n");
+
+        // Unstaging the original deletion and its terminated replacement while
+        // 'y' stays must keep the separator in the index.
+        repo.apply_lines(file, &[deleted(2), added(2)], true)
+            .unwrap();
+        assert_eq!(
+            staged(&repo, file).as_deref(),
+            Some(b"a\nb\ny\n".as_slice())
+        );
+        // With no other selected lines, a stale selection is a no-op.
+        repo.apply_lines(file, &[added(50)], true).unwrap();
+        assert_eq!(
+            staged(&repo, file).as_deref(),
+            Some(b"a\nb\ny\n".as_slice())
+        );
+
+        repo.apply_lines(file, &[deleted(2), added(2), added(3)], true)
+            .unwrap();
+        assert_eq!(staged(&repo, file).as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(fs::read(repo.workdir().join(file)).unwrap(), b"a\nx\ny\n");
+        let stale = repo
+            .apply_lines(file, &[added(3)], true)
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("no changes left"), "{stale}");
+    }
+
+    #[test]
+    fn unstaging_one_line_of_a_staged_deletion_recreates_only_that_line_in_the_index() {
+        let (_scratch, repo) = repository();
+        let file = "deleted.txt";
+        stage_commit(&repo, file, b"one\ntwo\nthree\n");
+        fs::remove_file(repo.workdir().join(file)).unwrap();
+        repo.stage(&[file]).unwrap();
+        assert!(staged(&repo, file).is_none());
+
+        repo.apply_lines(file, &[deleted(2)], true).unwrap();
+        assert_eq!(staged(&repo, file).as_deref(), Some(b"two\n".as_slice()));
+        assert!(!repo.workdir().join(file).exists());
+        assert_eq!(
+            repo.load_status().unwrap().staged[0].status,
+            FileStatus::Modified
+        );
+        repo.unstage_all().unwrap();
+        assert_eq!(
+            staged(&repo, file).as_deref(),
+            Some(b"one\ntwo\nthree\n".as_slice())
+        );
+        assert!(repo.load_status().unwrap().staged.is_empty());
+    }
+
+    #[test]
+    fn native_amend_updates_the_tree_and_message_while_keeping_the_existing_parent_and_author() {
+        let (_scratch, repo) = repository();
+        let file = "tracked.txt";
+        let parent = stage_commit(&repo, file, b"Parent\n");
+        write(&repo, file, b"Original tip\n");
+        repo.stage(&[file]).unwrap();
+        let old = repo.commit("Old tip", false).unwrap();
+        let author = repo.load_commit(&old).unwrap().author;
+        repo.set_local_config("user.name", Some("Different committer"))
+            .unwrap();
+        write(&repo, file, b"Amended tip\n");
+        repo.stage(&[file]).unwrap();
+        let amended = repo.commit("New tip", true).unwrap();
+        let replacement = repo.load_commit(&amended).unwrap();
+        assert_ne!(old, amended);
+        assert_eq!(replacement.parents, [parent]);
+        assert_eq!(replacement.author, author);
+        assert_eq!(replacement.summary, "New tip");
+        assert_eq!(
+            staged(&repo, file).as_deref(),
+            Some(b"Amended tip\n".as_slice())
+        );
+        assert!(repo.load_status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn git_commit_uses_the_configured_hooks_and_can_amend_with_hooks_skipped() {
+        let (_scratch, repo) = repository();
+        let file = "tracked.txt";
+        let base = stage_commit(&repo, file, b"Before\n");
+        let hooks = repo.git_dir().join("configured-hooks");
+        fs::create_dir(&hooks).unwrap();
+        repo.set_local_config("core.hooksPath", Some(".git/configured-hooks"))
+            .unwrap();
+        assert!(!repo.has_commit_hooks());
+        let hook = hooks.join("pre-commit");
+        fs::write(&hook, "#!/bin/sh\necho test-hook-rejected\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(repo.has_commit_hooks());
+        write(&repo, file, b"After\n");
+        repo.stage(&[file]).unwrap();
+
+        let error = repo
+            .commit_with_git("Subject", &CommitOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("test-hook-rejected"), "{error}");
+        assert_eq!(
+            repo.load_history(&Default::default())
+                .unwrap()
+                .head_sha
+                .as_deref(),
+            Some(base.as_str())
+        );
+        assert_eq!(staged(&repo, file).as_deref(), Some(b"After\n".as_slice()));
+        let amended = repo
+            .commit_with_git(
+                "Subject\n\n# Comment\nBody\n",
+                &CommitOptions {
+                    amend: true,
+                    skip_hooks: true,
+                    strip_comments: true,
+                    ..CommitOptions::default()
+                },
+            )
+            .unwrap();
+        assert_ne!(amended, base);
+        assert_eq!(repo.head_commit_message().unwrap(), "Subject\n\nBody\n");
+        assert!(repo.load_commit(&amended).unwrap().parents.is_empty());
+        assert!(repo.load_status().unwrap().is_empty());
+    }
+}

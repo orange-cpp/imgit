@@ -776,6 +776,525 @@ pub fn file_history_commit_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    fn file_fixture() -> (
+        tempfile::TempDir,
+        imgit_git::Repository,
+        Application,
+        String,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("File menu test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("file-menu@example.invalid"))
+            .unwrap();
+        repo.set_local_config("core.autocrlf", Some("false"))
+            .unwrap();
+        std::fs::create_dir_all(repo.workdir().join("src")).unwrap();
+        let tracked = ["src/first.txt", "src/second.txt", "outside.txt"];
+        for path in tracked {
+            std::fs::write(repo.workdir().join(path), "Original\n").unwrap();
+        }
+        repo.stage(&tracked).unwrap();
+        let base = repo.commit("Original files", false).unwrap();
+        let app = Application::with_config_directory(scratch.path().join("config"));
+        (scratch, repo, app, base)
+    }
+
+    fn choose(
+        frames: &mut TestFrames,
+        app: &mut Application,
+        label: &str,
+        build: impl FnOnce(&mut Cx<'_>, &mut Application, &mut RepoState) -> MenuItems,
+    ) {
+        frames.draw(|cx| {
+            let items = app.with_active(|app, state| build(cx, app, state)).unwrap();
+            let item = items
+                .into_iter()
+                .find(|item| item.label == label)
+                .unwrap_or_else(|| panic!("missing menu item {label:?}"));
+            assert!(item.enabled, "{label:?} is disabled");
+            item.click.unwrap()(cx, app);
+        });
+    }
+
+    #[test]
+    fn file_menus_stage_unstage_and_ignore_without_touching_other_files() {
+        let (_scratch, repo, mut app, _) = file_fixture();
+        let staged = "src/first.txt";
+        let ignored = "src/new-fixture.imtest";
+        for path in [staged, ignored] {
+            std::fs::write(repo.workdir().join(path), "Working copy\n").unwrap();
+        }
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let menu =
+            |cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState, staged_side: bool| {
+                let list = if staged_side {
+                    &state.status.staged
+                } else {
+                    &state.status.unstaged
+                };
+                let change = list
+                    .iter()
+                    .find(|change| change.path == staged)
+                    .unwrap()
+                    .clone();
+                workdir_file_menu(cx, app, state, &change, staged_side)
+            };
+
+        choose(&mut frames, &mut app, "Stage", |cx, app, state| {
+            menu(cx, app, state, false)
+        });
+        let state = app.active().unwrap();
+        assert_eq!(state.status.staged.len(), 1);
+        assert_eq!(state.status.staged[0].path, staged);
+        assert_eq!(state.status.unstaged[0].path, ignored);
+        choose(&mut frames, &mut app, "Unstage", |cx, app, state| {
+            menu(cx, app, state, true)
+        });
+        assert!(app.active().unwrap().status.staged.is_empty());
+
+        choose(
+            &mut frames,
+            &mut app,
+            "Ignore 'new-fixture.imtest'",
+            |cx, app, state| {
+                let file = state
+                    .status
+                    .unstaged
+                    .iter()
+                    .find(|change| change.path == ignored)
+                    .unwrap()
+                    .clone();
+                workdir_file_menu(cx, app, state, &file, false)
+                    .into_iter()
+                    .find(|item| item.label == "Ignore")
+                    .unwrap()
+                    .submenu
+            },
+        );
+        let state = app.active().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join(".gitignore")).unwrap(),
+            "src/new-fixture.imtest\n"
+        );
+        assert!(
+            state
+                .status
+                .unstaged
+                .iter()
+                .all(|change| change.path != ignored)
+        );
+        assert!(
+            state
+                .status
+                .unstaged
+                .iter()
+                .any(|change| change.path == staged)
+        );
+        assert!(repo.workdir().join(ignored).exists());
+    }
+
+    #[test]
+    fn folder_and_multi_file_commands_leave_outside_changes_intact() {
+        let (_scratch, repo, mut app, _) = file_fixture();
+        for path in ["src/first.txt", "src/second.txt", "outside.txt"] {
+            std::fs::write(repo.workdir().join(path), "Working copy\n").unwrap();
+        }
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let paths = || vec!["src/first.txt".to_owned(), "src/second.txt".to_owned()];
+        choose(&mut frames, &mut app, "Stage folder", |cx, app, state| {
+            folder_menu(cx, app, state, "src", paths(), false, true)
+        });
+        assert_eq!(app.active().unwrap().status.staged.len(), 2);
+
+        choose(
+            &mut frames,
+            &mut app,
+            "Unstage 2 files",
+            |cx, app, state| multiple_files_menu(cx, app, state, paths(), true),
+        );
+        assert!(app.active().unwrap().status.staged.is_empty());
+
+        choose(&mut frames, &mut app, "Stage 2 files", |cx, app, state| {
+            multiple_files_menu(cx, app, state, paths(), false)
+        });
+        assert_eq!(app.active().unwrap().status.staged.len(), 2);
+        choose(
+            &mut frames,
+            &mut app,
+            "Discard all changes in folder",
+            |cx, app, state| folder_menu(cx, app, state, "src", paths(), true, true),
+        );
+        let state = app.active().unwrap();
+        assert!(state.status.staged.is_empty());
+        assert_eq!(state.status.unstaged.len(), 1);
+        assert_eq!(state.status.unstaged[0].path, "outside.txt");
+        for path in paths() {
+            assert_eq!(
+                std::fs::read_to_string(repo.workdir().join(path)).unwrap(),
+                "Original\n"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join("outside.txt")).unwrap(),
+            "Working copy\n"
+        );
+    }
+
+    #[test]
+    fn commit_file_commands_restore_one_file_and_open_blame_at_the_requested_revision() {
+        let (_scratch, repo, mut app, base) = file_fixture();
+        let path = "src/first.txt";
+        let other = "src/second.txt";
+        for name in [path, other] {
+            std::fs::write(repo.workdir().join(name), "Second revision\n").unwrap();
+        }
+        repo.stage(&[path, other]).unwrap();
+        let head = repo.commit("Second revision", false).unwrap();
+        app.open_repository(&repo.workdir().to_string_lossy());
+        app.active_mut().unwrap().select_only(&base);
+        let mut frames = TestFrames::new();
+        choose(
+            &mut frames,
+            &mut app,
+            "Restore file from this commit",
+            |cx, app, state| {
+                commit_file_menu(cx, app, state, &base, &change(path, FileStatus::Added))
+            },
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restore did not finish"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join(path)).unwrap(),
+            "Original\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join(other)).unwrap(),
+            "Second revision\n"
+        );
+        assert_eq!(app.active().unwrap().status.staged[0].path, path);
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(head.as_str())
+        );
+
+        choose(&mut frames, &mut app, "File Blame", |cx, app, state| {
+            commit_file_menu(cx, app, state, &base, &change(path, FileStatus::Added))
+        });
+        let view = app.active().unwrap().file_history.as_ref().unwrap();
+        assert_eq!(view.path, path);
+        assert_eq!(view.from.as_deref(), Some(base.as_str()));
+        assert!(view.blame);
+        choose(&mut frames, &mut app, "Show in graph", |cx, app, state| {
+            file_history_commit_menu(cx, app, state, &head, path)
+        });
+        let state = app.active().unwrap();
+        assert!(state.file_history.is_none());
+        assert_eq!(state.selected, [head]);
+    }
+
+    #[test]
+    fn conflict_menus_open_text_conflicts_and_fall_back_to_the_binary_diff() {
+        let (_scratch, repo, mut app, base) = file_fixture();
+        let branch = repo
+            .load_history(&imgit_git::HistoryOptions::default())
+            .unwrap()
+            .head_branch
+            .unwrap();
+        let text = "src/first.txt";
+        let binary = "image.bin";
+        let commit_side = |label, bytes| {
+            std::fs::write(repo.workdir().join(text), label).unwrap();
+            std::fs::write(repo.workdir().join(binary), bytes).unwrap();
+            repo.stage(&[text, binary]).unwrap();
+            repo.commit(label, false).unwrap()
+        };
+        let ours = commit_side("our version", &[0u8, 1][..]);
+        repo.create_branch("incoming", &base, true).unwrap();
+        let theirs = commit_side("their version", &[0u8, 2][..]);
+        repo.checkout_branch(&branch).unwrap();
+        assert_eq!(
+            repo.merge("incoming", false).unwrap(),
+            imgit_git::repository::Outcome::Conflicts
+        );
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+
+        choose(
+            &mut frames,
+            &mut app,
+            "Open in merge tool",
+            |cx, app, state| {
+                let conflict = state
+                    .status
+                    .conflicted
+                    .iter()
+                    .find(|change| change.path == text)
+                    .unwrap()
+                    .clone();
+                let items = workdir_file_menu(cx, app, state, &conflict, false);
+                assert!(items.iter().all(|item| !matches!(
+                    item.label.as_str(),
+                    "Stash file" | "Discard changes" | "Stage"
+                )));
+                items
+            },
+        );
+        let tool = app.active().unwrap().merge_tool.as_ref().unwrap();
+        assert_eq!(tool.path, text);
+        assert_eq!(tool.ours_sha, ours);
+        assert_eq!(tool.theirs_sha, theirs);
+
+        choose(
+            &mut frames,
+            &mut app,
+            "Open in merge tool",
+            |cx, app, state| {
+                workdir_file_menu(
+                    cx,
+                    app,
+                    state,
+                    &change(binary, FileStatus::Conflicted),
+                    false,
+                )
+            },
+        );
+        assert_eq!(
+            app.toasts.history()[0].title,
+            "Could not open the merge tool"
+        );
+        let target = app.active().unwrap().diff_target.as_ref().unwrap();
+        assert_eq!(target.path, binary);
+        assert_eq!(target.source, DiffSource::Unstaged);
+
+        std::fs::write(repo.workdir().join(text), "merged content\n").unwrap();
+        choose(&mut frames, &mut app, "Mark resolved", |cx, app, state| {
+            workdir_file_menu(cx, app, state, &change(text, FileStatus::Conflicted), false)
+        });
+        let state = app.active().unwrap();
+        assert_eq!(state.status.conflicted.len(), 1);
+        assert_eq!(state.status.conflicted[0].path, binary);
+        assert!(state.status.staged.iter().any(|change| change.path == text));
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join(text)).unwrap(),
+            "merged content\n"
+        );
+    }
+
+    #[test]
+    fn editor_and_delete_actions_target_the_file_the_menu_was_opened_for() {
+        let (_scratch, repo, mut app, _) = file_fixture();
+        let path = "src/first.txt";
+        let file = repo.workdir().join(path);
+        std::fs::write(&file, "Edited\n").unwrap();
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let menu = |cx: &mut Cx<'_>, app: &mut Application, state: &mut RepoState| {
+            workdir_file_menu(cx, app, state, &change(path, FileStatus::Modified), false)
+        };
+        choose(&mut frames, &mut app, "Edit file", menu);
+        let editor = app.active().unwrap().file_edit.as_ref().unwrap();
+        assert_eq!(editor.path, path);
+        assert_eq!(editor.text, "Edited\n");
+        choose(&mut frames, &mut app, "Delete file", menu);
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert!(app.dialog.danger);
+        assert!(app.dialog.message.contains(path));
+        assert!(file.is_file());
+
+        let confirmed = app.dialog.on_confirm.take().unwrap();
+        app.dialog.close();
+        frames.draw(|cx| confirmed(cx, &mut app));
+        assert!(!file.exists());
+        let state = app.active().unwrap();
+        assert!(
+            state
+                .status
+                .unstaged
+                .iter()
+                .any(|change| change.path == path && change.status == FileStatus::Deleted)
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.workdir().join("src/second.txt")).unwrap(),
+            "Original\n"
+        );
+
+        std::fs::write(&file, "Recreated\n").unwrap();
+        choose(&mut frames, &mut app, "Delete file", menu);
+        let confirmed = app.dialog.on_confirm.take().unwrap();
+        app.dialog.close();
+        std::fs::remove_file(&file).unwrap();
+        frames.draw(|cx| confirmed(cx, &mut app));
+        assert_eq!(
+            app.toasts.history()[0].title,
+            "Could not delete src/first.txt"
+        );
+
+        frames.draw(|cx| {
+            app.with_active(|app, state| {
+                let items = menu(cx, app, state);
+                assert!(items.iter().all(|item| !matches!(
+                    item.label.as_str(),
+                    "Edit file" | "Delete file" | "Open file in default program"
+                )));
+            })
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn bulk_ignore_appends_only_selected_paths_and_reports_noop_or_write_error() {
+        let (_scratch, repo, mut app, _) = file_fixture();
+        let paths = vec!["src/generated.log".to_owned(), "outside.tmp".to_owned()];
+        for path in &paths {
+            std::fs::write(repo.workdir().join(path), "Generated\n").unwrap();
+        }
+        let file = repo.workdir().join(".gitignore");
+        std::fs::create_dir(&file).unwrap();
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let invoke = |frames: &mut TestFrames, app: &mut Application| {
+            choose(frames, app, "Ignore 2 files", |cx, app, state| {
+                multiple_files_menu(cx, app, state, paths.clone(), false)
+            });
+        };
+        invoke(&mut frames, &mut app);
+        assert_eq!(app.toasts.history()[0].title, "Could not write .gitignore");
+        assert_eq!(app.toasts.history()[0].kind, ToastKind::Error);
+        std::fs::remove_dir(&file).unwrap();
+
+        invoke(&mut frames, &mut app);
+        let expected = "src/generated.log\n/outside.tmp\n";
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+        assert_eq!(app.toasts.history()[0].title, "Added to .gitignore");
+        assert!(
+            app.active()
+                .unwrap()
+                .status
+                .unstaged
+                .iter()
+                .all(|change| !paths.contains(&change.path))
+        );
+        invoke(&mut frames, &mut app);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+        assert_eq!(app.toasts.history()[0].title, "Already in .gitignore");
+        assert_eq!(app.toasts.history()[0].kind, ToastKind::Info);
+    }
+
+    #[test]
+    fn single_file_and_folder_stashes_only_include_the_selected_paths() {
+        let (_scratch, repo, mut app, base) = file_fixture();
+        let paths = ["src/first.txt", "src/second.txt", "outside.txt"];
+        for path in paths {
+            std::fs::write(repo.workdir().join(path), "Modified\n").unwrap();
+        }
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        choose(&mut frames, &mut app, "Stash file", |cx, app, state| {
+            workdir_file_menu(
+                cx,
+                app,
+                state,
+                &change(paths[0], FileStatus::Modified),
+                false,
+            )
+        });
+        finish_file_command(&mut app, "Stash file");
+        let read = |path| std::fs::read_to_string(repo.workdir().join(path)).unwrap();
+        assert_eq!(read(paths[0]), "Original\n");
+        assert_eq!(read(paths[1]), "Modified\n");
+        assert_eq!(read(paths[2]), "Modified\n");
+
+        choose(&mut frames, &mut app, "Stash folder", |cx, app, state| {
+            folder_menu(
+                cx,
+                app,
+                state,
+                "src",
+                paths[..2].iter().map(|path| (*path).to_owned()).collect(),
+                false,
+                true,
+            )
+        });
+        finish_file_command(&mut app, "Stash folder");
+        assert_eq!(read(paths[1]), "Original\n");
+        assert_eq!(read(paths[2]), "Modified\n");
+        let state = app.active().unwrap();
+        let stashes: Vec<_> = state
+            .history
+            .refs
+            .iter()
+            .filter(|r| r.ref_type == imgit_git::RefType::Stash)
+            .collect();
+        assert_eq!(stashes.len(), 2);
+        let first = stashes
+            .iter()
+            .find(|stash| stash.stash_index == Some(1))
+            .unwrap()
+            .target
+            .clone();
+        let second = stashes
+            .iter()
+            .find(|stash| stash.stash_index == Some(0))
+            .unwrap()
+            .target
+            .clone();
+
+        choose(
+            &mut frames,
+            &mut app,
+            "Apply stashed file",
+            |cx, app, state| {
+                commit_file_menu(
+                    cx,
+                    app,
+                    state,
+                    &first,
+                    &change(paths[0], FileStatus::Modified),
+                )
+            },
+        );
+        finish_file_command(&mut app, "Apply stashed file");
+        assert_eq!(read(paths[0]), "Modified\n");
+        assert_eq!(read(paths[1]), "Original\n");
+        assert_eq!(read(paths[2]), "Modified\n");
+        let state = app.active().unwrap();
+        assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+        assert_eq!(state.repo.stash_index_of(&first), Some(1));
+        assert_eq!(state.repo.stash_index_of(&second), Some(0));
+    }
+
+    fn finish_file_command(app: &mut Application, title: &str) {
+        let operation = app.active().unwrap().async_op.as_ref().unwrap();
+        assert_eq!(operation.title, title);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{title} did not finish"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_ne!(
+            app.toasts.history()[0].kind,
+            ToastKind::Error,
+            "{:?}",
+            app.toasts.history()[0]
+        );
+    }
 
     fn change(path: &str, status: FileStatus) -> FileChange {
         FileChange {

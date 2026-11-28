@@ -69,6 +69,7 @@ pub struct State {
     dim_since: f64,
     /// The search input takes the focus back after Enter.
     search_refocus: bool,
+    inline_ref_input_id: usize,
     changes: ChangeCounts,
 }
 
@@ -604,6 +605,642 @@ fn draw_scroll_markers(cx: &Cx<'_>, state: &RepoState, row_h: f32, list_rows: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resizing_a_graph_column_commits_the_width_on_mouse_release() {
+        use crate::app::settings::Settings;
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, _repo, mut app, _, _) = graph_fixture();
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        let size = vec2(1180.0, 450.0);
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| draw_graph_view(cx, app, state, size))
+                .unwrap();
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw(cx, &mut app);
+            });
+        }
+        let layout = &app.panels.graph_view.zones;
+        let index = layout.index_of(ZoneType::Ref).unwrap();
+        let initial = layout.zones[index].current;
+        let x = zone_right(layout, origin.x + GRAPH_LEFT_MARGIN, index, 1.0);
+        let handle = vec2(x - 3.0, origin.y + GRAPH_HEADER_HEIGHT / 2.0);
+
+        frames.move_mouse(handle.into());
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_left_mouse(true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(app.panels.graph_view.zone_drag.unwrap().index, index);
+        assert!(app.panels.graph_view.zone_move.is_none());
+        frames.move_mouse((handle + vec2(45.0, 0.0)).into());
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!((app.panels.graph_view.zones.zones[index].current - initial - 45.0).abs() < 0.01);
+        assert!(!app.settings.graph_column_widths.contains_key("ref"));
+
+        frames.set_left_mouse(false);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!(app.panels.graph_view.zone_drag.is_none());
+        let mut stored = Settings::default();
+        stored.load(&app.config_path("settings.txt"));
+        let saved = stored.graph_column_widths[ZoneType::Ref.key()];
+        assert!((saved - initial - 45.0).abs() < 0.01);
+        assert!((app.panels.graph_view.zones.zones[index].preferred - saved).abs() < 0.01);
+    }
+
+    #[test]
+    fn dragging_the_graph_header_reorders_columns_and_saves_the_order() {
+        use crate::app::settings::Settings;
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, _repo, mut app, _, _) = graph_fixture();
+        app.settings.show_author = true;
+        app.settings.show_sha = true;
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        let size = vec2(1180.0, 470.0);
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| draw_graph_view(cx, app, state, size))
+                .unwrap();
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw(cx, &mut app);
+            });
+        }
+        let layout = &app.panels.graph_view.zones;
+        assert!(
+            layout.index_of(ZoneType::Author).unwrap()
+                > layout.index_of(ZoneType::Message).unwrap()
+        );
+        let placed = Zones::place(layout, origin.x + GRAPH_LEFT_MARGIN, 1.0);
+        let y = origin.y + GRAPH_HEADER_HEIGHT / 2.0;
+        let start = vec2(placed.x(ZoneType::Author) + 24.0, y);
+        let target = vec2(placed.x(ZoneType::Message) + 35.0, y);
+        frames.move_mouse(start.into());
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_left_mouse(true);
+        frames.draw(|cx| draw(cx, &mut app));
+        let pending = app.panels.graph_view.zone_move.unwrap();
+        assert_eq!(pending.zone, ZoneType::Author);
+        assert!(!pending.active);
+        frames.move_mouse(target.into());
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!(app.panels.graph_view.zone_move.unwrap().active);
+        let layout = &app.panels.graph_view.zones;
+        assert!(
+            layout.index_of(ZoneType::Author).unwrap()
+                < layout.index_of(ZoneType::Message).unwrap()
+        );
+
+        frames.set_left_mouse(false);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!(app.panels.graph_view.zone_move.is_none());
+        let mut stored = Settings::default();
+        stored.load(&app.config_path("settings.txt"));
+        assert_eq!(stored.graph_column_order, app.settings.graph_column_order);
+        let author = stored
+            .graph_column_order
+            .iter()
+            .position(|key| key == ZoneType::Author.key())
+            .unwrap();
+        let message = stored
+            .graph_column_order
+            .iter()
+            .position(|key| key == ZoneType::Message.key())
+            .unwrap();
+        assert!(author < message);
+    }
+
+    #[test]
+    fn navigating_a_long_graph_scrolls_between_its_workdir_and_oldest_commit() {
+        use crate::shell::test_frame::TestFrames;
+        use dear_imgui_rs::Key;
+
+        let (_scratch, repo, mut app, first, latest) = graph_fixture();
+        repo.create_branch("review", &latest, true).unwrap();
+        let review = repo.commit("Review side", false).unwrap();
+        let main = app.active().unwrap().history.head_branch.clone().unwrap();
+        repo.checkout_branch(&main).unwrap();
+        for i in 0..26 {
+            repo.commit(&format!("Work item {i}"), false).unwrap();
+        }
+        let main_tip = repo
+            .load_history(&imgit_git::HistoryOptions::default())
+            .unwrap()
+            .head_sha
+            .unwrap();
+        assert!(repo.merge("review", true).unwrap().is_done());
+        std::fs::write(repo.workdir().join("draft.txt"), "Saved work").unwrap();
+        let stash = repo.stash_push("Graph stash").unwrap();
+        std::fs::write(repo.workdir().join("draft.txt"), "New work").unwrap();
+        repo.create_tag("v1", &first, None).unwrap();
+        // A remote tracking branch also gets a scroll marker.
+        repo.add_remote("mirror", ".").unwrap();
+        let output = imgit_git::cli::run(
+            repo.workdir(),
+            ["update-ref", "refs/remotes/mirror/review", &review],
+            imgit_git::cli::RunOptions::default(),
+        );
+        assert!(output.success(), "{}", output.text);
+
+        let state = app.active_mut().unwrap();
+        state.refresh();
+        assert!(state.history.commits.len() > 28);
+        assert!(
+            state
+                .history
+                .commits
+                .iter()
+                .any(|commit| commit.parents == [main_tip.as_str(), review.as_str()])
+        );
+        assert!(state.commit_for(&stash).is_some());
+        assert!(state.history.row_by_sha.contains_key(imgit_app::WIP_SHA));
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        let size = vec2(1160.0, 280.0);
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| draw_graph_view(cx, app, state, size))
+                .unwrap();
+        };
+        for _ in 0..3 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw(cx, &mut app);
+            });
+        }
+
+        frames.set_key(Key::End, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_key(Key::End, false);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(app.active().unwrap().selected, [first.as_str()]);
+        assert!(app.active().unwrap().scroll_to_row.is_none());
+        let bottom = origin + vec2(340.0, size.y - 20.0);
+        frames.move_mouse(bottom.into());
+        frames.draw(|cx| draw(cx, &mut app));
+        let hovered = app.active().unwrap().hovered_sha.as_deref().unwrap();
+        assert!(app.active().unwrap().history.row_by_sha[hovered] > 20);
+
+        frames.set_key(Key::Home, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_key(Key::Home, false);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(app.active().unwrap().selected, [imgit_app::WIP_SHA]);
+        let top = origin
+            + vec2(
+                340.0,
+                GRAPH_HEADER_HEIGHT + GRAPH_HEADER_MARGIN_BOTTOM + 7.0,
+            );
+        frames.move_mouse(top.into());
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(
+            app.active().unwrap().hovered_sha.as_deref(),
+            Some(imgit_app::WIP_SHA)
+        );
+    }
+
+    #[test]
+    fn shift_wheel_scrolls_a_graph_with_more_lanes_than_its_column_fits() {
+        use crate::shell::test_frame::TestFrames;
+        use dear_imgui_rs::Key;
+
+        let (_scratch, repo, mut app, _, latest) = graph_fixture();
+        let main = app.active().unwrap().history.head_branch.clone().unwrap();
+        for i in 0..12 {
+            let name = format!("topic-{i:02}");
+            repo.create_branch(&name, &latest, true).unwrap();
+            repo.commit(&format!("Work in {name}"), false).unwrap();
+        }
+        repo.checkout_branch(&main).unwrap();
+        app.active_mut().unwrap().refresh();
+        assert!(app.active().unwrap().layout.max_columns >= 10);
+        app.settings
+            .graph_column_widths
+            .insert("graph".to_owned(), 95.0);
+
+        let mut frames = TestFrames::new();
+        let size = vec2(1050.0, 420.0);
+        let mut origin = Vec2::ZERO;
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| draw_graph_view(cx, app, state, size))
+                .unwrap();
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw(cx, &mut app);
+            });
+        }
+        let layout = &app.panels.graph_view.zones;
+        let placed = Zones::place(layout, origin.x + GRAPH_LEFT_MARGIN, 1.0);
+        let lane = vec2(
+            placed.x(ZoneType::Graph) + 34.0,
+            origin.y + GRAPH_HEADER_HEIGHT + GRAPH_HEADER_MARGIN_BOTTOM + 52.0,
+        );
+        frames.move_mouse(lane.into());
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!((app.panels.graph_view.graph_scroll).abs() < 0.001);
+
+        frames.set_key(Key::ModShift, true);
+        frames.scroll_vertical(-1.0);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!(app.panels.graph_view.graph_scroll > 20.0);
+        frames.scroll_vertical(10.0);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!((app.panels.graph_view.graph_scroll).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_commit_row_opens_its_context_menu_and_double_click_shows_details() {
+        use crate::shell::test_frame::TestFrames;
+        use crate::ui::menu::{draw_menus, menu_open};
+        use dear_imgui_rs::Key;
+
+        let (_scratch, repo, mut app, first, latest) = graph_fixture();
+        let initial_branch = app.active().unwrap().history.head_branch.clone();
+        app.settings.show_author = true;
+        app.settings.show_date = true;
+        app.settings.show_sha = true;
+        app.settings.description_on_hover = true;
+        app.show_detail_panel = false;
+        let mut frames = TestFrames::new();
+        let mut origin = Vec2::ZERO;
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            app.with_active(|app, state| draw_graph_view(cx, app, state, vec2(1180.0, 420.0)))
+                .unwrap();
+            draw_menus(cx, app);
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw(cx, &mut app);
+            });
+        }
+        let row = app.active().unwrap().history.row_by_sha[&first];
+        let m = Metrics::new(app.settings.compact_graph, 1.0);
+        let zones = Zones::place(
+            &app.panels.graph_view.zones,
+            origin.x + GRAPH_LEFT_MARGIN,
+            1.0,
+        );
+        let point = vec2(
+            zones.x(ZoneType::Message) + 38.0,
+            origin.y
+                + GRAPH_HEADER_HEIGHT
+                + GRAPH_HEADER_MARGIN_BOTTOM
+                + (row as f32 + 0.5) * m.px(m.row_height),
+        );
+        frames.move_mouse(point.into());
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(
+            app.active().unwrap().hovered_sha.as_deref(),
+            Some(first.as_str())
+        );
+        frames.set_right_mouse(true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(app.active().unwrap().selected, [first.as_str()]);
+        frames.set_right_mouse(false);
+        frames.draw(|cx| {
+            draw(cx, &mut app);
+            assert!(menu_open(cx));
+        });
+        assert_eq!(app.panels.graph_view.context_sha, first);
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| {
+            draw(cx, &mut app);
+            assert!(!menu_open(cx));
+        });
+        frames.set_key(Key::Escape, false);
+        frames.draw(|cx| draw(cx, &mut app));
+
+        for _ in 0..2 {
+            frames.set_left_mouse(true);
+            frames.draw(|cx| draw(cx, &mut app));
+            frames.set_left_mouse(false);
+            frames.draw(|cx| draw(cx, &mut app));
+        }
+        assert!(app.show_detail_panel);
+        let state = app.active().unwrap();
+        assert_eq!(state.history.head_branch, initial_branch);
+        assert_eq!(state.history.head_sha.as_deref(), Some(latest.as_str()));
+        assert_eq!(repo.head_commit_message().unwrap(), "Latest\n\nMore detail");
+    }
+
+    #[test]
+    fn inline_graph_refs_validate_names_and_attach_to_the_selected_commit() {
+        use crate::app::dialog::DialogKind;
+        use crate::shell::test_frame::TestFrames;
+        use dear_imgui_rs::Key;
+
+        let (_scratch, _repo, mut app, first, latest) = graph_fixture();
+        let mut frames = TestFrames::new();
+        let draw = |cx: &mut Cx<'_>, app: &mut Application| {
+            panels::draw_dialogs(cx, app);
+            app.with_active(|app, state| draw_graph_view(cx, app, state, vec2(1180.0, 420.0)))
+                .unwrap();
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| draw(cx, &mut app));
+        }
+        app.dialog.open(DialogKind::CreateBranch);
+        app.dialog.sha.clone_from(&first);
+        for _ in 0..3 {
+            frames.draw(|cx| draw(cx, &mut app));
+        }
+        assert_eq!(app.dialog.kind, None);
+        assert_eq!(app.active().unwrap().selected, [first.as_str()]);
+        frames.type_text("-invalid");
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert_eq!(
+            app.active().unwrap().inline_ref.as_ref().unwrap().name,
+            "-invalid"
+        );
+        assert!(
+            app.active()
+                .unwrap()
+                .find_ref("refs/heads/-invalid")
+                .is_none()
+        );
+        frames.set_key(Key::Enter, false);
+        frames.draw(|cx| draw(cx, &mut app));
+        frames.set_key(Key::Escape, true);
+        frames.draw(|cx| draw(cx, &mut app));
+        assert!(app.active().unwrap().inline_ref.is_none());
+        frames.set_key(Key::Escape, false);
+
+        for (kind, name, full) in [
+            (
+                DialogKind::CreateBranch,
+                "topic/inline",
+                "refs/heads/topic/inline",
+            ),
+            (DialogKind::CreateTag, "v-inline", "refs/tags/v-inline"),
+        ] {
+            app.dialog.open(kind);
+            app.dialog.sha.clone_from(&first);
+            for _ in 0..3 {
+                frames.draw(|cx| draw(cx, &mut app));
+            }
+            frames.type_text(name);
+            frames.draw(|cx| draw(cx, &mut app));
+            assert_eq!(
+                app.active().unwrap().inline_ref.as_ref().unwrap().name,
+                name,
+                "{kind:?}"
+            );
+            frames.set_key(Key::Enter, true);
+            frames.draw(|cx| draw(cx, &mut app));
+            assert!(app.active().unwrap().inline_ref.is_none(), "{kind:?}");
+            let reference = app.active().unwrap().find_ref(full).unwrap();
+            assert_eq!(reference.target, first);
+            frames.set_key(Key::Enter, false);
+            frames.draw(|cx| draw(cx, &mut app));
+        }
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(latest.as_str())
+        );
+    }
+
+    fn graph_fixture() -> (
+        tempfile::TempDir,
+        imgit_git::Repository,
+        Application,
+        String,
+        String,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("graph")).unwrap();
+        repo.set_local_config("user.name", Some("Graph test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("graph@example.invalid"))
+            .unwrap();
+        repo.set_local_config("tag.gpgSign", Some("false")).unwrap();
+        let first = repo.commit("First\n\nInitial details", false).unwrap();
+        let latest = repo.commit("Latest\n\nMore detail", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, repo, app, first, latest)
+    }
+
+    #[test]
+    fn keyboard_navigation_extends_a_range_from_the_focused_commit() {
+        use crate::shell::test_frame::TestFrames;
+        use dear_imgui_rs::Key;
+        use imgit_git::Repository;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Graph test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("graph@example.invalid"))
+            .unwrap();
+        let oldest = repo.commit("First", false).unwrap();
+        let middle = repo.commit("Second", false).unwrap();
+        let newest = repo.commit("Third", false).unwrap();
+        repo.create_branch("topic/example", &middle, false).unwrap();
+        repo.create_tag("v1.0", &oldest, None).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            let draw = |frames: &mut TestFrames, app: &mut Application, state: &mut RepoState| {
+                frames.draw(|cx| draw_graph_view(cx, app, state, vec2(1180.0, 520.0)));
+            };
+            for _ in 0..3 {
+                draw(&mut frames, app, state);
+            }
+
+            frames.set_key(Key::End, true);
+            draw(&mut frames, app, state);
+            assert_eq!(state.selected, [oldest]);
+            frames.set_key(Key::End, false);
+
+            frames.set_key(Key::UpArrow, true);
+            draw(&mut frames, app, state);
+            assert_eq!(state.selected, [middle.as_str()]);
+            frames.set_key(Key::UpArrow, false);
+            draw(&mut frames, app, state);
+
+            frames.set_key(Key::ModShift, true);
+            frames.set_key(Key::UpArrow, true);
+            draw(&mut frames, app, state);
+            assert_eq!(state.selected, [newest.as_str(), middle.as_str()]);
+            assert_eq!(state.focused.as_deref(), Some(middle.as_str()));
+            assert_eq!(state.range_cursor.as_deref(), Some(newest.as_str()));
+            frames.set_key(Key::UpArrow, false);
+            draw(&mut frames, app, state);
+
+            frames.set_key(Key::DownArrow, true);
+            draw(&mut frames, app, state);
+            assert_eq!(state.selected, [middle]);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_compact_graph_loads_more_commits_and_counts_changes_for_their_rows() {
+        use imgit_git::Repository;
+
+        use crate::shell::test_frame::TestFrames;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Graph counts test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("graph-counts@example.invalid"))
+            .unwrap();
+        std::fs::write(repo.workdir().join("edited.txt"), "Before\n").unwrap();
+        std::fs::write(repo.workdir().join("deleted.txt"), "Delete me\n").unwrap();
+        repo.stage_all().unwrap();
+        let first = repo.commit("Original files", false).unwrap();
+        std::fs::write(repo.workdir().join("edited.txt"), "After\n").unwrap();
+        std::fs::remove_file(repo.workdir().join("deleted.txt")).unwrap();
+        std::fs::write(repo.workdir().join("created.txt"), "Created\n").unwrap();
+        repo.stage_all().unwrap();
+        let head = repo.commit("Change all three", false).unwrap();
+        std::fs::write(repo.workdir().join("working.txt"), "Working copy\n").unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.settings.compact_graph = true;
+        app.settings.show_changes = true;
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let state = app.active_mut().unwrap();
+        state.commit_limit = 1;
+        state.refresh();
+        assert!(state.history.has_more);
+        assert!(state.commit_for(&first).is_none());
+        let mut frames = TestFrames::new();
+        let mut frames_drawn = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            frames.draw(|cx| {
+                app.with_active(|app, state| draw_graph_view(cx, app, state, vec2(1180.0, 480.0)))
+                    .unwrap();
+            });
+            frames_drawn += 1;
+            if app
+                .panels
+                .graph_view
+                .changes
+                .get(repo.workdir(), &first)
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "graph counts did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(frames_drawn > 1);
+        let state = app.active().unwrap();
+        assert!(!state.history.has_more);
+        assert!(state.commit_for(&first).is_some());
+        let counts = &app.panels.graph_view.changes;
+        assert_eq!(
+            counts.get(repo.workdir(), &first),
+            Some(&changes::FileCounts {
+                added: 2,
+                ..changes::FileCounts::default()
+            })
+        );
+        assert_eq!(
+            counts.get(repo.workdir(), &head),
+            Some(&changes::FileCounts {
+                added: 1,
+                modified: 1,
+                deleted: 1
+            })
+        );
+    }
+
+    #[test]
+    fn dragging_a_branch_pill_opens_the_drop_menu_on_another_branch() {
+        use dear_imgui_rs::Key;
+        use imgit_git::Repository;
+
+        use crate::shell::test_frame::TestFrames;
+        use crate::ui::menu::{draw_menus, menu_open};
+
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Graph drag test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("graph-drag@example.invalid"))
+            .unwrap();
+        let parent = repo.commit("Parent", false).unwrap();
+        repo.create_branch("topic", &parent, false).unwrap();
+        let newer = repo.commit("Newer", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        let size = vec2(1180.0, 460.0);
+        let mut origin = Vec2::ZERO;
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                app.with_active(|app, state| draw_graph_view(cx, app, state, size))
+                    .unwrap();
+            });
+        }
+        let graph = &app.panels.graph_view;
+        let zones = Zones::place(&graph.zones, origin.x + GRAPH_LEFT_MARGIN, 1.0);
+        let metrics = Metrics::new(app.settings.compact_graph, 1.0);
+        let row_height = metrics.px(metrics.row_height);
+        let pill = |sha: &str| {
+            let index = app.active().unwrap().history.row_by_sha[sha];
+            vec2(
+                zones.x(ZoneType::Ref) + 16.0,
+                origin.y
+                    + GRAPH_HEADER_HEIGHT
+                    + GRAPH_HEADER_MARGIN_BOTTOM
+                    + row_height * (index as f32 + 0.5),
+            )
+        };
+        let source = pill(&parent);
+        let target = pill(&newer);
+        let draw = |frames: &mut TestFrames, app: &mut Application| {
+            let mut open = false;
+            frames.draw(|cx| {
+                app.with_active(|app, state| draw_graph_view(cx, app, state, size))
+                    .unwrap();
+                draw_menus(cx, app);
+                open = menu_open(cx);
+            });
+            open
+        };
+        frames.move_mouse(source.into());
+        draw(&mut frames, &mut app);
+        draw(&mut frames, &mut app);
+        frames.set_left_mouse(true);
+        draw(&mut frames, &mut app);
+        assert!(app.panels.graph_view.refs.drag.pressed);
+        frames.move_mouse(target.into());
+        assert!(!draw(&mut frames, &mut app));
+        assert!(app.panels.graph_view.refs.drag.active);
+        let drop_target = app.panels.graph_view.refs.drop_target.as_ref().unwrap();
+        assert_eq!(drop_target.target, newer);
+
+        frames.set_left_mouse(false);
+        assert!(draw(&mut frames, &mut app));
+        assert!(!app.panels.graph_view.refs.drag.active);
+        frames.set_key(Key::Escape, true);
+        assert!(!draw(&mut frames, &mut app));
+        let state = app.active().unwrap();
+        assert_eq!(state.history.head_sha.as_deref(), Some(newer.as_str()));
+        assert_eq!(state.find_ref("refs/heads/topic").unwrap().target, parent);
+    }
 
     #[test]
     fn timeline_buckets_step_with_the_age() {

@@ -913,6 +913,410 @@ fn draw_palette(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn viewing_a_modified_file_from_the_palette_opens_its_working_copy() {
+        let (_scratch, repo, mut app, _) = palette_repo();
+        fs::write(repo.workdir().join("tracked.txt"), "current working copy\n").unwrap();
+        app.active_mut().unwrap().refresh();
+        let mut frames = TestFrames::new();
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "View File");
+        assert!(app.fuzzy.open);
+        assert_eq!(app.panels.fuzzy_finder.stage, Stage::File);
+
+        choose(&mut frames, &mut app, "tracked.txt");
+        assert!(!app.fuzzy.open);
+        let state = app.active().unwrap();
+        let target = state.diff_target.as_ref().unwrap();
+        assert_eq!(target.path, "tracked.txt");
+        assert_eq!(target.source, DiffSource::Unstaged);
+        assert!(state.file_view);
+        let diff = state.diff.as_ref().unwrap();
+        assert!(
+            diff.hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| line.text == "current working copy")
+        );
+    }
+
+    fn choose(frames: &mut TestFrames, app: &mut Application, query: &str) {
+        for _ in 0..3 {
+            frames.draw(|cx| draw_fuzzy_finder(cx, app));
+        }
+        frames.type_text(query);
+        frames.draw(|cx| draw_fuzzy_finder(cx, app));
+        assert_eq!(app.fuzzy.text, query);
+        frames.set_key(Key::Enter, true);
+        frames.draw(|cx| draw_fuzzy_finder(cx, app));
+        frames.set_key(Key::Enter, false);
+        frames.draw(|cx| draw_fuzzy_finder(cx, app));
+    }
+
+    fn palette_repo() -> (
+        tempfile::TempDir,
+        imgit_git::Repository,
+        Application,
+        String,
+    ) {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("Palette test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("palette@example.invalid"))
+            .unwrap();
+        repo.set_local_config("core.autocrlf", Some("false"))
+            .unwrap();
+        for name in ["tracked.txt", "other.txt"] {
+            fs::write(repo.workdir().join(name), "Base\n").unwrap();
+        }
+        repo.stage(&["tracked.txt", "other.txt"]).unwrap();
+        let base = repo.commit("Base", false).unwrap();
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        (scratch, repo, app, base)
+    }
+
+    #[test]
+    fn palette_staging_waits_for_the_running_command_then_updates_the_index() {
+        use imgit_app::{job::Job, repo_state::AsyncOperation};
+
+        let (_scratch, repo, mut app, base) = palette_repo();
+        fs::write(repo.workdir().join("tracked.txt"), "changed\n").unwrap();
+        fs::write(repo.workdir().join("new.txt"), "new file\n").unwrap();
+        let state = app.active_mut().unwrap();
+        state.refresh();
+        state.async_op = Some(AsyncOperation {
+            title: "Fetch".to_owned(),
+            job: Job::idle(),
+            silent: false,
+            args: vec!["fetch".to_owned()],
+            attempt: None,
+            queued: Vec::new(),
+        });
+
+        let mut frames = TestFrames::new();
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Stage all changes");
+        assert_eq!(app.toasts.history()[0].title, "Wait for Fetch to finish");
+        assert!(app.active().unwrap().status.staged.is_empty());
+        assert_eq!(app.active().unwrap().status.unstaged.len(), 2);
+        app.active_mut().unwrap().async_op = None;
+
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Stage all changes");
+        let state = app.active().unwrap();
+        assert_eq!(state.status.staged.len(), 2);
+        assert!(state.status.unstaged.is_empty());
+        assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Unstage all changes");
+        let state = app.active().unwrap();
+        assert!(state.status.staged.is_empty());
+        assert_eq!(state.status.unstaged.len(), 2);
+        assert_eq!(
+            fs::read_to_string(repo.workdir().join("tracked.txt")).unwrap(),
+            "changed\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.workdir().join("new.txt")).unwrap(),
+            "new file\n"
+        );
+    }
+
+    #[test]
+    fn palette_commands_open_repository_actions_and_save_display_changes() {
+        use crate::app::settings::Settings;
+
+        let (_scratch, _repo, mut app, base) = palette_repo();
+        let mut frames = TestFrames::new();
+        let invoke = |frames: &mut TestFrames, app: &mut Application, query| {
+            app.fuzzy.show();
+            choose(frames, app, query);
+            assert!(!app.fuzzy.open);
+        };
+        invoke(&mut frames, &mut app, "Create Annotated Tag");
+        assert!(app.dialog.is(DialogKind::CreateTag));
+        assert!(app.dialog.flag);
+        assert_eq!(app.dialog.sha, base);
+        app.dialog.close();
+        invoke(&mut frames, &mut app, "Rename Branch");
+        let branch = app.active().unwrap().history.head_branch.as_ref().unwrap();
+        assert!(app.dialog.is(DialogKind::RenameBranch));
+        assert_eq!(&app.dialog.ref_name, branch);
+        assert_eq!(&app.dialog.text_a, branch);
+        app.dialog.close();
+
+        invoke(&mut frames, &mut app, "Configure Commit Signing");
+        assert!(app.preferences_open);
+        assert_eq!(app.preferences_page, "Commit Signing");
+        app.preferences_open = false;
+        invoke(&mut frames, &mut app, "Activity Logs");
+        assert!(app.notifications_requested);
+        invoke(&mut frames, &mut app, "Open Repository Management Tab");
+        assert!(app.repo_management_open);
+
+        let labels = app.settings.show_toolbar_labels;
+        let syntax = app.settings.syntax_highlighting;
+        let zoom = app.settings.zoom;
+        invoke(&mut frames, &mut app, "Toggle Toolbar Labels");
+        invoke(&mut frames, &mut app, "Toggle Syntax Highlighting");
+        invoke(&mut frames, &mut app, "Increase Zoom");
+        let mut saved = Settings::default();
+        saved.load(&app.config_path("settings.txt"));
+        assert_eq!(saved.show_toolbar_labels, !labels);
+        assert_eq!(saved.syntax_highlighting, !syntax);
+        assert!((saved.zoom - (zoom + 0.1)).abs() < 0.001);
+        invoke(&mut frames, &mut app, "Decrease Zoom");
+        assert!((app.settings.zoom - zoom).abs() < 0.001);
+        invoke(&mut frames, &mut app, "Reset Zoom");
+        assert!((app.settings.zoom - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_palette_runs_the_configured_diff_tool_only_for_changed_files() {
+        let (_scratch, repo, mut app, _) = palette_repo();
+        repo.set_local_config("diff.tool", Some("imgittest"))
+            .unwrap();
+        repo.set_local_config(
+            "difftool.imgittest.cmd",
+            Some("printf 'invoked' > .git/imgit-diff-probe"),
+        )
+        .unwrap();
+        let probe = repo.git_dir().join("imgit-diff-probe");
+        let mut frames = TestFrames::new();
+        let invoke = |frames: &mut TestFrames, app: &mut Application| {
+            app.fuzzy.show();
+            choose(frames, app, "Open in External Diff/Merge Tool");
+            assert_eq!(app.panels.fuzzy_finder.stage, Stage::File);
+            choose(frames, app, "tracked.txt");
+            assert!(!app.fuzzy.open);
+        };
+        invoke(&mut frames, &mut app);
+        assert!(!probe.exists());
+        assert!(!app.active().unwrap().busy());
+        assert_eq!(app.toasts.history()[0].title, "No changes in tracked.txt");
+
+        fs::write(repo.workdir().join("tracked.txt"), "staged change\n").unwrap();
+        repo.stage(&["tracked.txt"]).unwrap();
+        app.active_mut().unwrap().refresh();
+        invoke(&mut frames, &mut app);
+        let op = app.active().unwrap().async_op.as_ref().unwrap();
+        assert!(op.silent);
+        assert_eq!(op.args, ["difftool", "-y", "--cached", "--", "tracked.txt"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "difftool did not finish"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(fs::read_to_string(probe).unwrap(), "invoked");
+        assert_eq!(app.active().unwrap().status.staged.len(), 1);
+        assert!(app.active().unwrap().status.unstaged.is_empty());
+    }
+
+    #[test]
+    fn checkout_uses_the_matching_branch_instead_of_the_current_branch() {
+        let (_scratch, repo, mut app, base) = palette_repo();
+        repo.create_branch("topic/target", &base, false).unwrap();
+        let original = app.active().unwrap().history.head_branch.clone();
+        let newer = repo.commit("Newer", false).unwrap();
+        app.active_mut().unwrap().refresh();
+
+        let mut frames = TestFrames::new();
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Checkout");
+        assert_eq!(app.panels.fuzzy_finder.stage, Stage::Checkout);
+        choose(&mut frames, &mut app, "topic/target");
+        let state = app.active().unwrap();
+        assert_eq!(state.history.head_branch.as_deref(), Some("topic/target"));
+        assert_eq!(state.history.head_sha.as_deref(), Some(base.as_str()));
+        assert!(!app.fuzzy.open);
+
+        app.with_active(|app, state| app.undo(state)).unwrap();
+        let state = app.active().unwrap();
+        assert_eq!(state.history.head_branch, original);
+        assert_eq!(state.history.head_sha.as_deref(), Some(newer.as_str()));
+    }
+
+    #[test]
+    fn stash_apply_and_pop_target_the_selected_entry_without_altering_the_others() {
+        let (_scratch, repo, mut app, _) = palette_repo();
+        let tracked = repo.workdir().join("tracked.txt");
+        let other = repo.workdir().join("other.txt");
+        fs::write(&tracked, "Chosen work\n").unwrap();
+        let chosen = repo.stash_push("chosen stash").unwrap();
+        fs::write(&other, "Other work\n").unwrap();
+        let keep = repo.stash_push("keep this stash").unwrap();
+        app.active_mut().unwrap().refresh();
+        assert_eq!(repo.stash_index_of(&chosen), Some(1));
+
+        let mut frames = TestFrames::new();
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Stash: Apply");
+        assert_eq!(app.panels.fuzzy_finder.stage, Stage::StashApply);
+        choose(&mut frames, &mut app, "chosen stash");
+        assert_eq!(repo.stash_index_of(&chosen), Some(1));
+        assert_eq!(fs::read(&tracked).unwrap(), b"Chosen work\n");
+        assert_eq!(fs::read(&other).unwrap(), b"Base\n");
+
+        fs::write(&tracked, "Base\n").unwrap();
+        app.active_mut().unwrap().refresh();
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Stash: Pop");
+        assert_eq!(app.panels.fuzzy_finder.stage, Stage::StashPop);
+        choose(&mut frames, &mut app, "chosen stash");
+        assert_eq!(repo.stash_index_of(&chosen), None);
+        assert_eq!(repo.stash_index_of(&keep), Some(0));
+        assert_eq!(fs::read(&tracked).unwrap(), b"Chosen work\n");
+        assert_eq!(fs::read(&other).unwrap(), b"Base\n");
+    }
+
+    #[test]
+    fn switching_theme_profile_and_recent_repository_passes_the_selected_value() {
+        let (scratch, repo, mut app, _) = palette_repo();
+        let target = imgit_git::Repository::init(scratch.path().join("palette-target")).unwrap();
+        app.open_repository(&target.workdir().to_string_lossy());
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let original = app.profiles.current().guid.clone();
+        let profile = app
+            .profiles
+            .create(
+                imgit_app::profiles::Profile {
+                    name: "Palette Profile".to_owned(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let mut frames = TestFrames::new();
+
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Switch Theme");
+        assert_eq!(app.panels.fuzzy_finder.stage, Stage::SwitchTheme);
+        choose(&mut frames, &mut app, "ImGit Light");
+        assert_eq!(app.settings.theme, "ImGit Light");
+        frames.draw(|cx| assert!(cx.palette.light));
+
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Switch to Profile");
+        assert_eq!(app.panels.fuzzy_finder.stage, Stage::SwitchProfile);
+        choose(&mut frames, &mut app, "Palette Profile");
+        assert_eq!(app.pending_profile.as_deref(), Some(profile.as_str()));
+        assert_eq!(app.profiles.current().guid, original);
+
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Open Repo");
+        assert_eq!(app.panels.fuzzy_finder.stage, Stage::OpenRepo);
+        choose(&mut frames, &mut app, "palette-target");
+        assert_eq!(app.active_workdir(), Some(target.workdir()));
+        assert!(!app.fuzzy.open);
+    }
+
+    #[test]
+    fn the_file_picker_opens_blame_and_defers_deletion_until_confirmation() {
+        let (scratch, repo, mut app, base) = palette_repo();
+        let file = repo.workdir().join("tracked.txt");
+        let second = imgit_git::Repository::init(scratch.path().join("different")).unwrap();
+        let other_file = second.workdir().join("tracked.txt");
+        fs::write(&other_file, "Unrelated\n").unwrap();
+        let mut frames = TestFrames::new();
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Blame");
+        choose(&mut frames, &mut app, "tracked.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let state = app.active_mut().unwrap();
+            state.poll_file_history();
+            let view = state.file_history.as_ref().unwrap();
+            if !view.history_loading && !view.blame_loading {
+                assert!(view.blame);
+                assert_eq!(view.path, "tracked.txt");
+                assert_eq!(view.blame_data.as_ref().unwrap().hunks[0].sha, base);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "blame did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.active_mut().unwrap().close_file_history();
+
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Delete File");
+        choose(&mut frames, &mut app, "tracked.txt");
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert!(app.dialog.danger);
+        assert!(file.is_file());
+        let confirm = app.dialog.on_confirm.take().unwrap();
+        app.dialog.close();
+        app.open_repository(&second.workdir().to_string_lossy());
+        frames.draw(|cx| confirm(cx, &mut app));
+        assert!(!file.exists());
+        assert_eq!(fs::read(other_file).unwrap(), b"Unrelated\n");
+        app.with_repo(repo.workdir(), |_, state| {
+            let deleted = state
+                .status
+                .unstaged
+                .iter()
+                .find(|change| change.path == "tracked.txt")
+                .unwrap();
+            assert_eq!(deleted.status, FileStatus::Deleted);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn view_file_uses_the_staged_diff_or_history_and_edit_uses_the_working_file() {
+        let (_scratch, repo, mut app, _) = palette_repo();
+        let file = repo.workdir().join("tracked.txt");
+        fs::write(&file, "In the index\n").unwrap();
+        repo.stage(&["tracked.txt"]).unwrap();
+        app.active_mut().unwrap().refresh();
+        let mut frames = TestFrames::new();
+
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "View File");
+        choose(&mut frames, &mut app, "tracked.txt");
+        let state = app.active().unwrap();
+        assert_eq!(
+            state.diff_target.as_ref().unwrap().source,
+            DiffSource::Staged
+        );
+        assert!(state.file_view);
+        let mut lines = state
+            .diff
+            .as_ref()
+            .unwrap()
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines);
+        assert!(lines.any(|line| line.text == "In the index"));
+
+        fs::write(&file, "Only in the working directory\n").unwrap();
+        app.active_mut().unwrap().refresh();
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "Edit File");
+        choose(&mut frames, &mut app, "tracked.txt");
+        let edit = app.active().unwrap().file_edit.as_ref().unwrap();
+        assert_eq!(edit.path, "tracked.txt");
+        assert_eq!(edit.text, "Only in the working directory\n");
+        assert!(!edit.is_dirty());
+        assert!(app.active_mut().unwrap().close_diff());
+
+        app.fuzzy.show();
+        choose(&mut frames, &mut app, "View File");
+        choose(&mut frames, &mut app, "other.txt");
+        let state = app.active().unwrap();
+        assert!(state.diff_target.is_none());
+        let history = state.file_history.as_ref().unwrap();
+        assert_eq!(history.path, "other.txt");
+        assert!(!history.blame);
+    }
 
     #[test]
     fn an_empty_query_lists_everything_in_order() {

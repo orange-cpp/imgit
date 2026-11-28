@@ -1500,6 +1500,741 @@ mod tests {
             .clone()
     }
 
+    fn take_action(items: MenuItems, label: &str) -> crate::app::action::Action {
+        items
+            .into_iter()
+            .find(|item| item.label == label)
+            .unwrap_or_else(|| panic!("menu is missing {label:?}"))
+            .click
+            .expect("the item has an action")
+    }
+
+    #[test]
+    fn a_multi_commit_menu_prepares_squash_in_oldest_first_order() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let (two, three) = app
+            .with_active(|_, state| (sha_of(state, "two"), sha_of(state, "three")))
+            .unwrap();
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    state.select(&three, false, false);
+                    state.select(&two, true, false);
+                    let menu = commit_menu(cx, app, state, &two);
+                    take_action(menu, "Squash 2 commits")
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+        assert!(app.dialog.is(DialogKind::SquashCommits));
+        assert_eq!(app.dialog.shas, [two, three]);
+        assert_eq!(app.dialog.text_a, "two\n\nthree");
+    }
+
+    #[test]
+    fn rebase_actions_from_a_commit_menu_use_that_commit_as_the_base() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let state = app.active().unwrap();
+        let (base, head) = (sha_of(state, "two"), sha_of(state, "three"));
+        let interactive = format!("Interactive Rebase 1 children of {}", &base[..6]);
+        let mut frames = TestFrames::new();
+        let invoke = |frames: &mut TestFrames, app: &mut Application, label: &str| {
+            frames.draw(|cx| {
+                let action = app
+                    .with_active(|app, state| {
+                        take_action(commit_menu(cx, app, state, &base), label)
+                    })
+                    .unwrap();
+                action(cx, app);
+            });
+        };
+        invoke(&mut frames, &mut app, &interactive);
+        let plan = &app.active().unwrap().rebase;
+        assert!(plan.active);
+        assert_eq!(plan.base, base);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].step.sha, head);
+
+        app.active_mut().unwrap().rebase.active = false;
+        invoke(&mut frames, &mut app, "Rebase main onto this commit");
+        finish_git_operation(&mut app, "Rebase");
+        assert_eq!(
+            app.active().unwrap().history.head_sha.as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(log(app.active().unwrap()), ["three", "two", "one"]);
+    }
+
+    #[test]
+    fn remote_checkout_creates_a_local_tracking_branch_that_can_be_redone() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        app.with_active(|_, state| {
+            let dir = state.repo.workdir();
+            git(dir, &["remote", "add", "origin", "."]);
+            git(
+                dir,
+                &["update-ref", "refs/remotes/origin/remote-topic", "HEAD~1"],
+            );
+            state.refresh();
+        })
+        .unwrap();
+
+        let mut frames = TestFrames::new();
+        activate_ref_menu(
+            &mut frames,
+            &mut app,
+            "refs/remotes/origin/remote-topic",
+            "Checkout origin/remote-topic",
+        );
+
+        app.with_active(|app, state| {
+            let assert_tracking = |state: &RepoState| {
+                let head = state.head_ref().unwrap();
+                assert_eq!(head.full_name, "refs/heads/remote-topic");
+                assert_eq!(head.upstream.as_deref(), Some("origin/remote-topic"));
+                assert_eq!(head.target, sha_of(state, "two"));
+            };
+            assert_tracking(state);
+            app.undo(state);
+            assert_eq!(state.history.head_branch.as_deref(), Some("main"));
+            assert_eq!(
+                state.history.head_sha.as_deref(),
+                Some(sha_of(state, "three").as_str())
+            );
+            app.redo(state);
+            assert_tracking(state);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_drag_merge_checks_out_the_receiver_and_makes_a_merge_commit() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let (head, original_receiver) = app
+            .with_active(|_, state| {
+                let before = sha_of(state, "two");
+                state
+                    .repo
+                    .create_branch("receiver", &before, false)
+                    .unwrap();
+                state.refresh();
+                (sha_of(state, "three"), before)
+            })
+            .unwrap();
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    let main = state.find_ref("refs/heads/main").unwrap().clone();
+                    let receiver = state.find_ref("refs/heads/receiver").unwrap().clone();
+                    take_action(
+                        ref_drop_menu(cx, app, state, &main, &receiver),
+                        "Merge main into receiver",
+                    )
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+
+        let state = app.active().unwrap();
+        let merged = state.head_ref().unwrap();
+        assert_eq!(merged.name, "receiver");
+        assert_eq!(
+            state.commit_for(&merged.target).unwrap().parents,
+            [original_receiver, head.clone()]
+        );
+        assert_eq!(state.find_ref("refs/heads/main").unwrap().target, head);
+        assert!(state.status.is_empty());
+    }
+
+    #[test]
+    fn a_tag_menu_can_push_to_one_or_every_local_remote() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (scratch, mut app) = fixture();
+        let dir = app.active_workdir().unwrap().to_path_buf();
+        let state = app.active().unwrap();
+        let tip = sha_of(state, "three");
+        let first_remote = scratch.path().join("origin.git");
+        let second_remote = scratch.path().join("backup.git");
+        git(
+            &dir,
+            &["-c", "tag.gpgSign=false", "tag", "v-single", "HEAD"],
+        );
+        git(&dir, &["-c", "tag.gpgSign=false", "tag", "v-all", "HEAD~1"]);
+        git(
+            scratch.path(),
+            &["init", "--bare", &first_remote.to_string_lossy()],
+        );
+        git(
+            &dir,
+            &["remote", "add", "origin", &first_remote.to_string_lossy()],
+        );
+        app.active_mut().unwrap().refresh();
+
+        let mut frames = TestFrames::new();
+        activate_ref_menu(
+            &mut frames,
+            &mut app,
+            "refs/tags/v-single",
+            "Push v-single to origin",
+        );
+        finish_git_operation(&mut app, "Push tag");
+        assert_eq!(
+            git(&first_remote, &["rev-parse", "refs/tags/v-single"]).trim(),
+            tip
+        );
+
+        git(
+            scratch.path(),
+            &["init", "--bare", &second_remote.to_string_lossy()],
+        );
+        git(
+            &dir,
+            &["remote", "add", "backup", &second_remote.to_string_lossy()],
+        );
+        app.active_mut().unwrap().refresh();
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    let tag = state.find_ref("refs/tags/v-all").unwrap().clone();
+                    let submenu = ref_menu(cx, app, state, &tag, true)
+                        .into_iter()
+                        .find(|item| item.label == "Push tag to remote")
+                        .unwrap()
+                        .submenu;
+                    take_action(submenu, "Push v-all to all remotes")
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+        assert_eq!(
+            app.active()
+                .unwrap()
+                .async_op
+                .as_ref()
+                .unwrap()
+                .queued
+                .len(),
+            1
+        );
+        finish_git_operation(&mut app, "Push tag");
+        let tagged = sha_of(app.active().unwrap(), "two");
+        for path in [&first_remote, &second_remote] {
+            assert_eq!(git(path, &["rev-parse", "refs/tags/v-all"]).trim(), tagged);
+        }
+        assert_eq!(git(&second_remote, &["tag", "--list"]).trim(), "v-all");
+    }
+
+    #[test]
+    fn stash_actions_use_the_selected_stash_message_and_identity() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let (older, latest) = app
+            .with_active(|_, state| {
+                let dir = state.repo.workdir();
+                std::fs::write(dir.join("one.txt"), "older saved edit\n").unwrap();
+                let older = state.repo.stash_push("First saved edit").unwrap();
+                std::fs::write(dir.join("two.txt"), "newer saved edit\n").unwrap();
+                let latest = state.repo.stash_push("Second saved edit").unwrap();
+                state.refresh();
+                (older, latest)
+            })
+            .unwrap();
+
+        let mut frames = TestFrames::new();
+        let invoke = |frames: &mut TestFrames, app: &mut Application, sha: &str, label: &str| {
+            frames.draw(|cx| {
+                let action = app
+                    .with_active(|app, state| take_action(commit_menu(cx, app, state, sha), label))
+                    .unwrap();
+                action(cx, app);
+            });
+        };
+        invoke(&mut frames, &mut app, &older, "Edit stash message");
+        assert!(app.dialog.is(DialogKind::EditStashMessage));
+        assert_eq!(app.dialog.sha, older);
+        assert_eq!(app.dialog.text_a, "First saved edit");
+        app.dialog.close();
+
+        invoke(&mut frames, &mut app, &older, "Delete Stash");
+        assert!(app.dialog.is(DialogKind::DeleteStash));
+        assert_eq!(app.dialog.stash_index, Some(1));
+        assert_eq!(app.dialog.sha, older);
+        assert_eq!(app.dialog.ref_name, "stash@{1}");
+        assert_eq!(app.dialog.text_b, "First saved edit");
+        app.dialog.close();
+
+        invoke(&mut frames, &mut app, &latest, "Pop Stash");
+        let state = app.active().unwrap();
+        assert_eq!(state.repo.stash_index_of(&latest), None);
+        assert_eq!(state.repo.stash_index_of(&older), Some(0));
+        assert_eq!(
+            std::fs::read_to_string(state.repo.workdir().join("two.txt"))
+                .unwrap()
+                .trim(),
+            "newer saved edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.repo.workdir().join("one.txt"))
+                .unwrap()
+                .trim(),
+            "one"
+        );
+        assert_eq!(app.toasts.history()[0].title, "Stash popped");
+    }
+
+    fn activate_ref_menu(
+        frames: &mut crate::shell::test_frame::TestFrames,
+        app: &mut Application,
+        reference: &str,
+        label: &str,
+    ) {
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    let reference = state.find_ref(reference).unwrap().clone();
+                    take_action(ref_menu(cx, app, state, &reference, true), label)
+                })
+                .unwrap();
+            action(cx, app);
+        });
+    }
+
+    fn finish_git_operation(app: &mut Application, title: &str) {
+        use std::time::{Duration, Instant};
+
+        let operation = app
+            .active()
+            .unwrap()
+            .async_op
+            .as_ref()
+            .expect("Git operation should start");
+        assert_eq!(operation.title, title);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(Instant::now() < deadline, "{title} timed out");
+            app.poll_async();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let toast = &app.toasts.history()[0];
+        assert_ne!(toast.kind, ToastKind::Error, "{title} failed: {toast:?}");
+    }
+
+    #[test]
+    fn dropping_a_diverged_branch_offers_an_interactive_plan_from_its_fork() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let (main_head, topic_head, two) = app
+            .with_active(|_, state| {
+                let dir = state.repo.workdir().to_path_buf();
+                let one = sha_of(state, "one");
+                git(&dir, &["checkout", "-b", "topic", &one]);
+                commit_file(&dir, "topic.txt", "topic only");
+                git(&dir, &["checkout", "main"]);
+                state.refresh();
+                (
+                    sha_of(state, "three"),
+                    sha_of(state, "topic only"),
+                    sha_of(state, "two"),
+                )
+            })
+            .unwrap();
+
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    let main = state.find_ref("refs/heads/main").unwrap().clone();
+                    let topic = state.find_ref("refs/heads/topic").unwrap().clone();
+                    let menu = ref_drop_menu(cx, app, state, &main, &topic);
+                    let names = labels(&menu);
+                    assert!(names.contains(&"Merge main into topic".to_owned()));
+                    assert!(names.contains(&"Rebase main onto topic".to_owned()));
+                    assert!(names.iter().all(|name| !name.starts_with("Fast-forward")));
+                    take_action(menu, "Interactive Rebase main onto topic")
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+
+        app.with_active(|_, state| {
+            assert!(state.rebase.active);
+            assert_eq!(state.rebase.base, topic_head);
+            assert_eq!(state.rebase.base_label, "topic");
+            assert_eq!(state.rebase.head_label, "main");
+            let steps: Vec<_> = state
+                .rebase
+                .steps
+                .iter()
+                .map(|row| row.step.sha.as_str())
+                .collect();
+            assert_eq!(steps, [two.as_str(), main_head.as_str()]);
+            assert_eq!(state.history.head_sha.as_deref(), Some(main_head.as_str()));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_tag_menu_offers_each_remote_and_annotates_its_original_commit() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let tagged = app
+            .with_active(|_, state| {
+                let dir = state.repo.workdir().to_path_buf();
+                git(&dir, &["tag", "v1", "HEAD~1"]);
+                for name in ["origin", "backup"] {
+                    git(&dir, &["remote", "add", name, "."]);
+                }
+                state.refresh();
+                sha_of(state, "two")
+            })
+            .unwrap();
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    let tag = state.find_ref("refs/tags/v1").unwrap().clone();
+                    let menu = ref_menu(cx, app, state, &tag, true);
+                    let push = menu
+                        .iter()
+                        .find(|item| item.label == "Push tag to remote")
+                        .unwrap();
+                    let names = labels(&push.submenu);
+                    for entry in [
+                        "Push v1 to backup",
+                        "Push v1 to origin",
+                        "Push v1 to all remotes",
+                    ] {
+                        assert!(names.iter().any(|name| name == entry), "{entry}");
+                    }
+                    take_action(menu, "Annotate v1")
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+        assert!(app.dialog.is(DialogKind::CreateTag));
+        assert_eq!(app.dialog.sha, tagged);
+        assert_eq!(app.dialog.text_a, "v1");
+        assert!(app.dialog.flag);
+    }
+
+    #[test]
+    fn a_stash_commit_menu_applies_its_stash_without_removing_it() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let sha = app
+            .with_active(|_, state| {
+                let file = state.repo.workdir().join("one.txt");
+                std::fs::write(&file, "local change\n").unwrap();
+                let sha = state.repo.stash_push("change").unwrap();
+                assert_ne!(
+                    std::fs::read_to_string(&file)
+                        .unwrap()
+                        .lines()
+                        .collect::<Vec<_>>(),
+                    ["local change"]
+                );
+                state.refresh();
+                sha
+            })
+            .unwrap();
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    take_action(commit_menu(cx, app, state, &sha), "Apply Stash")
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+        app.with_active(|app, state| {
+            assert_eq!(app.toasts.history()[0].title, "Stash applied");
+            let file = state.repo.workdir().join("one.txt");
+            assert_eq!(
+                std::fs::read_to_string(&file)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["local change"]
+            );
+            assert_eq!(state.repo.stash_index_of(&sha), Some(0));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn fast_forwarding_another_branch_from_its_menu_is_undoable_and_redoable() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let (before, head) = app
+            .with_active(|_, state| {
+                let before = sha_of(state, "two");
+                state.repo.create_branch("behind", &before, false).unwrap();
+                state.refresh();
+                (before, sha_of(state, "three"))
+            })
+            .unwrap();
+
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    let behind = state.find_ref("refs/heads/behind").unwrap().clone();
+                    take_action(
+                        ref_menu(cx, app, state, &behind, true),
+                        "Fast-forward behind to main",
+                    )
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+
+        app.with_active(|app, state| {
+            let tip =
+                |state: &RepoState| state.find_ref("refs/heads/behind").unwrap().target.clone();
+            assert_eq!(tip(state), head);
+            assert_eq!(state.history.head_branch.as_deref(), Some("main"));
+            assert!(state.status.is_empty());
+            app.undo(state);
+            assert_eq!(tip(state), before);
+            app.redo(state);
+            assert_eq!(tip(state), head);
+            assert_eq!(state.history.head_sha.as_deref(), Some(head.as_str()));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pull_and_push_from_an_untracked_branch_use_the_menu_upstream_rules() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        app.with_active(|_, state| {
+            let before = sha_of(state, "two");
+            state.repo.create_branch("behind", &before, false).unwrap();
+            state.repo.add_remote("origin", ".").unwrap();
+            state.refresh();
+        })
+        .unwrap();
+
+        let mut frames = TestFrames::new();
+        let choose = |frames: &mut TestFrames, app: &mut Application, label: &str| {
+            frames.draw(|cx| {
+                let action = app
+                    .with_active(|app, state| {
+                        let behind = state.find_ref("refs/heads/behind").unwrap().clone();
+                        take_action(ref_menu(cx, app, state, &behind, true), label)
+                    })
+                    .unwrap();
+                action(cx, app);
+            });
+        };
+        choose(&mut frames, &mut app, "Pull (fast-forward if possible)");
+        assert!(!app.active().unwrap().busy());
+        assert_eq!(app.toasts.history()[0].title, "Pull failed");
+
+        choose(&mut frames, &mut app, "Push");
+        assert!(app.dialog.is(DialogKind::PushNewBranch));
+        assert_eq!(app.dialog.ref_name, "behind");
+        assert_eq!(app.dialog.text_a, "origin");
+        assert!(!app.active().unwrap().busy());
+        choose(&mut frames, &mut app, "Set Upstream");
+        assert!(app.dialog.is(DialogKind::SetUpstream));
+        assert_eq!(app.dialog.ref_name, "behind");
+        assert!(app.dialog.text_a.is_empty());
+    }
+
+    #[test]
+    fn grouped_branch_menus_pin_and_solo_the_requested_remote_ref() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        app.with_active(|_, state| {
+            let dir = state.repo.workdir();
+            git(dir, &["branch", "topic", "HEAD~1"]);
+            for remote in ["origin", "backup"] {
+                git(dir, &["remote", "add", remote, "."]);
+                git(
+                    dir,
+                    &[
+                        "update-ref",
+                        &format!("refs/remotes/{remote}/topic"),
+                        "HEAD~1",
+                    ],
+                );
+            }
+            state.refresh();
+        })
+        .unwrap();
+
+        let mut frames = TestFrames::new();
+        let choose =
+            |frames: &mut TestFrames, app: &mut Application, parent: &str, child: Option<&str>| {
+                frames.draw(|cx| {
+                    let action = app
+                        .with_active(|app, state| {
+                            let topic = state.find_ref("refs/heads/topic").unwrap().clone();
+                            let menu = ref_menu(cx, app, state, &topic, false);
+                            if let Some(label) = child {
+                                let node =
+                                    menu.into_iter().find(|item| item.label == parent).unwrap();
+                                take_action(node.submenu, label)
+                            } else {
+                                take_action(menu, parent)
+                            }
+                        })
+                        .unwrap();
+                    action(cx, app);
+                });
+            };
+        choose(&mut frames, &mut app, "Pin to Left", Some("backup/topic"));
+        assert_eq!(
+            app.active().unwrap().pinned_branch.as_deref(),
+            Some("refs/remotes/backup/topic")
+        );
+        choose(&mut frames, &mut app, "Unpin from Left", None);
+        assert!(app.active().unwrap().pinned_branch.is_none());
+        choose(&mut frames, &mut app, "Solo", Some("origin/topic"));
+        assert_eq!(
+            app.active().unwrap().solo_ref.as_deref(),
+            Some("refs/remotes/origin/topic")
+        );
+        // The soloed ref is now the only visible member of its group.
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    let origin = state.find_ref("refs/remotes/origin/topic").unwrap().clone();
+                    take_action(ref_menu(cx, app, state, &origin, false), "Solo")
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+        assert!(app.active().unwrap().solo_ref.is_none());
+    }
+
+    #[test]
+    fn deleting_a_branch_group_removes_only_that_branch_from_both_local_remotes() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (scratch, mut app) = fixture();
+        let local = app.active_workdir().unwrap().to_owned();
+        let remotes: Vec<_> = ["origin", "backup"]
+            .into_iter()
+            .map(|name| (name, scratch.path().join(format!("{name}.git"))))
+            .collect();
+        git(&local, &["branch", "topic", "HEAD~1"]);
+        for (name, path) in &remotes {
+            git(scratch.path(), &["init", "--bare", &path.to_string_lossy()]);
+            git(&local, &["remote", "add", name, &path.to_string_lossy()]);
+            git(&local, &["push", "--", name, "topic", "main"]);
+        }
+        app.active_mut().unwrap().refresh();
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            let action = app
+                .with_active(|app, state| {
+                    let local = state.find_ref("refs/heads/topic").unwrap().clone();
+                    let items = ref_menu(cx, app, state, &local, false);
+                    take_action(items, "Delete all \"topic\" branches (local && remote)")
+                })
+                .unwrap();
+            action(cx, &mut app);
+        });
+        assert!(app.dialog.is(DialogKind::Confirm));
+        assert!(app.dialog.danger);
+        assert!(app.active().unwrap().find_ref("refs/heads/topic").is_some());
+        let confirm = app.dialog.on_confirm.take().unwrap();
+        app.dialog.close();
+        frames.draw(|cx| confirm(cx, &mut app));
+        let state = app.active().unwrap();
+        assert!(state.find_ref("refs/heads/topic").is_none());
+        let operation = state.async_op.as_ref().unwrap();
+        assert_eq!(operation.title, "Delete remote branches");
+        assert_eq!(operation.queued.len(), 1);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.active().unwrap().busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "branch deletion did not finish"
+            );
+            app.poll_async();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let state = app.active().unwrap();
+        assert_eq!(state.history.head_branch.as_deref(), Some("main"));
+        assert_ne!(app.toasts.history()[0].kind, ToastKind::Error);
+        for (name, path) in remotes {
+            let branches = git(
+                &path,
+                &["for-each-ref", "--format=%(refname)", "refs/heads"],
+            );
+            assert_eq!(branches.lines().collect::<Vec<_>>(), ["refs/heads/main"]);
+            assert!(
+                state
+                    .find_ref(&format!("refs/remotes/{name}/topic"))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn commit_menus_limit_ref_submenus_but_keep_the_commit_actions() {
+        use crate::shell::test_frame::TestFrames;
+
+        let (_scratch, mut app) = fixture();
+        let sha = app
+            .with_active(|_, state| {
+                let sha = sha_of(state, "two");
+                for index in 0..22 {
+                    state
+                        .repo
+                        .create_branch(&format!("topic-{index:02}"), &sha, false)
+                        .unwrap();
+                }
+                state.refresh();
+                sha
+            })
+            .unwrap();
+        let mut frames = TestFrames::new();
+        frames.draw(|cx| {
+            app.with_active(|app, state| {
+                let menu = commit_menu(cx, app, state, &sha);
+                assert_eq!(
+                    menu.iter()
+                        .filter(|item| item.label.starts_with("topic-") && !item.submenu.is_empty())
+                        .count(),
+                    20
+                );
+                let omitted = menu
+                    .iter()
+                    .find(|item| item.label == "2 more refs not displayed")
+                    .unwrap();
+                assert!(!omitted.enabled);
+                assert!(
+                    menu.iter()
+                        .any(|item| item.label == "Checkout this commit" && item.enabled)
+                );
+            })
+            .unwrap();
+        });
+    }
+
     #[test]
     fn only_head_and_the_chain_above_the_first_merge_can_be_reworded() {
         let (_scratch, mut app) = fixture();

@@ -664,6 +664,150 @@ mod tests {
     }
 
     #[test]
+    fn expanding_a_folder_reveals_its_files_and_routes_row_actions() {
+        use crate::shell::test_frame::TestFrames;
+
+        let mut changes = vec![
+            change("src/a.rs", FileStatus::Modified, 2, 1),
+            change("src/b.rs", FileStatus::Added, 3, 0),
+            change("src/c.rs", FileStatus::Deleted, 0, 4),
+        ];
+        changes[0].old_path = Some("src/original.rs".to_owned());
+        let tree = build_tree(&changes, true);
+        let mut frames = TestFrames::new();
+        let mut expanded = HashSet::new();
+        let mut events = Vec::new();
+        let mut origin = Vec2::ZERO;
+        let mut spacing = 0.0;
+        let width = 560.0;
+        let target = DiffTarget {
+            source: DiffSource::Unstaged,
+            path: "src/a.rs".to_owned(),
+            status: FileStatus::Modified,
+        };
+        let mut draw = |cx: &mut Cx<'_>| {
+            let origin = cx.cursor();
+            let mut list = FileList {
+                width,
+                kind: ListKind::Unstaged,
+                action: Some(RowAction::Stage),
+                file_sort: FileSort::Path,
+                diff_target: Some(&target),
+                expanded: &mut expanded,
+                events: Vec::new(),
+            };
+            list.draw(cx, &tree, 0, "workdir:");
+            events.extend(list.events);
+            origin
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                spacing = cx.ui.clone_style().item_spacing()[1];
+                origin = draw(cx);
+            });
+        }
+        let folder = origin + vec2(40.0, 12.0);
+        frames.click_left(folder, |cx| {
+            draw(cx);
+        });
+
+        let file_y = 24.0 + spacing + 16.0;
+        let file = origin + vec2(80.0, file_y);
+        frames.click_left(file, |cx| {
+            draw(cx);
+        });
+        frames.click_left(origin + vec2(width - 25.0, file_y), |cx| {
+            draw(cx);
+        });
+        frames.move_mouse(folder.into());
+        frames.draw(|cx| {
+            draw(cx);
+        });
+        frames.set_right_mouse(true);
+        frames.draw(|cx| {
+            draw(cx);
+        });
+        frames.set_right_mouse(false);
+        frames.draw(|cx| {
+            draw(cx);
+        });
+        frames.move_mouse(file.into());
+        frames.draw(|cx| {
+            draw(cx);
+        });
+        frames.set_right_mouse(true);
+        frames.draw(|cx| {
+            draw(cx);
+        });
+        frames.set_right_mouse(false);
+        frames.draw(|cx| {
+            draw(cx);
+        });
+
+        assert!(expanded.contains("workdir:src"));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ListEvent::Open(change) if change.path == "src/a.rs"))
+        );
+        assert!(
+            events.iter().any(
+                |event| matches!(event, ListEvent::Action(change) if change.path == "src/a.rs")
+            )
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, ListEvent::FileMenu(change) if change.path == "src/a.rs")
+        ));
+        let files = events
+            .iter()
+            .find_map(|event| {
+                if let ListEvent::FolderMenu { folder, files } = event {
+                    (folder == "src").then_some(files)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(files, &["src/a.rs", "src/b.rs", "src/c.rs"]);
+    }
+
+    #[test]
+    fn a_file_section_collapses_independently_of_its_bulk_button() {
+        use crate::shell::test_frame::TestFrames;
+
+        let mut frames = TestFrames::new();
+        let mut collapsed = HashSet::new();
+        let mut origin = Vec2::ZERO;
+        let mut last = (true, false);
+        let mut fired = false;
+        let width = 540.0;
+        let mut draw = |cx: &mut Cx<'_>| {
+            let header = SectionHeader {
+                label: "Staged Files",
+                count: 2,
+                pos: cx.cursor(),
+                width,
+                top_margin: 4.0,
+                button_label: Some("Unstage All"),
+                danger: true,
+            };
+            last = header.draw(cx, &mut collapsed);
+            fired |= last.1;
+        };
+        for _ in 0..2 {
+            frames.draw(|cx| {
+                origin = cx.cursor();
+                draw(cx);
+            });
+        }
+        frames.click_left(origin + vec2(26.0, 27.0), &mut draw);
+        frames.click_left(origin + vec2(width - 34.0, 27.0), &mut draw);
+        assert!(!last.0);
+        assert!(fired);
+        assert_eq!(collapsed, HashSet::from(["files:Staged Files".to_owned()]));
+    }
+
+    #[test]
     fn tree_groups_folders_and_counts() {
         let changes = sample();
         let root = build_tree(&changes, true);

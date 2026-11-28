@@ -670,6 +670,92 @@ fn draw_toolbar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::test_frame::TestFrames;
+
+    #[test]
+    fn file_history_switches_revisions_and_preserves_the_selection_when_toggling_blame() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = imgit_git::Repository::init(scratch.path().join("repo")).unwrap();
+        repo.set_local_config("user.name", Some("History test"))
+            .unwrap();
+        repo.set_local_config("user.email", Some("history@example.invalid"))
+            .unwrap();
+        let file = repo.workdir().join("file.txt");
+        std::fs::write(&file, "Keep\nOlder\n").unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let older = repo.commit("Older", false).unwrap();
+        std::fs::write(&file, "Keep\nNewer\n").unwrap();
+        repo.stage(&["file.txt"]).unwrap();
+        let newer = repo.commit("Newer", false).unwrap();
+
+        let mut app = Application::with_config_directory(scratch.path().join("config"));
+        app.open_repository(&repo.workdir().to_string_lossy());
+        let mut frames = TestFrames::new();
+        app.with_active(|app, state| {
+            state.open_file_history("file.txt", None, None, true);
+            let size = vec2(1180.0, 530.0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut origin = Vec2::ZERO;
+            loop {
+                frames.draw(|cx| {
+                    origin = cx.cursor();
+                    draw_file_history(cx, app, state, size);
+                });
+                let loaded = state.file_history.as_ref().unwrap();
+                if !loaded.history_loading && !loaded.blame_loading {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "file history did not load"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let loaded = state.file_history.as_ref().unwrap();
+            assert_eq!(loaded.selected_sha.as_deref(), Some(newer.as_str()));
+            assert_eq!(loaded.history.entries.len(), 2);
+            assert!(loaded.blame_data.is_some());
+            frames.click_left(
+                origin + vec2(100.0, HEADER_H + LIST_TOP_PADDING + ROW_H * 1.5),
+                |cx| draw_file_history(cx, app, state, size),
+            );
+            assert_eq!(
+                state.file_history.as_ref().unwrap().selected_sha.as_deref(),
+                Some(older.as_str())
+            );
+
+            let mut diff_button = Vec2::ZERO;
+            let mut blame_button = Vec2::ZERO;
+            frames.draw(|cx| {
+                let fw = view_toggle_width(cx, Some("File View"), None);
+                let dw = view_toggle_width(cx, Some("Diff View"), None);
+                let bw = view_toggle_width(cx, Some("Blame"), None);
+                let pane_x = origin.x + LIST_W + 1.0;
+                let pane_w = size.x - LIST_W - 1.0;
+                let y = origin.y + HEADER_H + 20.0;
+                diff_button = vec2(
+                    pane_x + ((pane_w - fw - dw) / 2.0).round() + fw + dw / 2.0,
+                    y,
+                );
+                blame_button = vec2(origin.x + size.x - 10.0 - bw / 2.0, y);
+                draw_file_history(cx, app, state, size);
+            });
+            frames.click_left(diff_button, |cx| draw_file_history(cx, app, state, size));
+            let view = state.file_history.as_ref().unwrap();
+            assert!(!view.file_view && !view.blame);
+            assert_eq!(view.selected_sha.as_deref(), Some(older.as_str()));
+
+            frames.click_left(blame_button, |cx| draw_file_history(cx, app, state, size));
+            let view = state.file_history.as_ref().unwrap();
+            assert!(view.file_view && view.blame);
+            assert_eq!(view.selected_sha.as_deref(), Some(older.as_str()));
+            frames.click_left(origin + vec2(size.x - 20.0, 17.5), |cx| {
+                draw_file_history(cx, app, state, size)
+            });
+            assert!(state.file_history.is_none());
+        })
+        .unwrap();
+    }
 
     #[test]
     fn the_oldest_entry_is_labelled_by_what_it_did() {
